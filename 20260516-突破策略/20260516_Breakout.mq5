@@ -14,12 +14,14 @@
 input group "=== 波段识别参数 ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1; // K线周期
 input int      InpMAPeriod = 14;                // MA周期
-input double   InpWavePercent = 0.1;            // 波段阈值百分比(%)
+input double   InpMinWavePercent = 0.1;         // 最小波段阈值百分比(%)
+input double   InpMaxWavePercent = 1.0;         // 最大波段阈值百分比(%)
 input double   InpPullbackTolerance = 0.0;      // 反向突破容忍度(%) 0=不容忍
 
 input group "=== 风险管理参数 ==="
 input double   InpStopLossPercent = 0.05;       // 止损百分比(%)
 input double   InpRiskRewardRatio = 1.5;        // 盈亏比
+input bool     InpUseTrailingStop = true;       // 使用移动止损
 input int      InpMaxHoldingMinutes = 5;        // 最大持仓时间(分钟)
 
 input group "=== 仓位管理参数 ==="
@@ -102,12 +104,13 @@ int OnInit()
     Print("品种:", _Symbol);
     Print("K线周期:", EnumToString(InpTimeframe));
     Print("MA周期:", InpMAPeriod);
-    Print("波段阈值: ", InpWavePercent, "%");
+    Print("波段阈值范围: ", InpMinWavePercent, "% - ", InpMaxWavePercent, "%");
     if(InpPullbackTolerance > 0)
         Print("反向突破容忍度: ", DoubleToString(InpPullbackTolerance, 1), "% (启用)");
     else
         Print("反向突破容忍度: 0% (禁用 - 保持原有逻辑)");
-    Print("止损:", InpStopLossPercent, "% | 盈亏比:", InpRiskRewardRatio);
+    Print("止损:", InpStopLossPercent, "% (最小1美元) | 盈亏比:", InpRiskRewardRatio);
+    Print("移动止损:", (InpUseTrailingStop ? "启用" : "禁用"));
     Print("最大持仓时间:", InpMaxHoldingMinutes, "分钟");
     Print("最大开仓手数:", InpMaxPositions);
     Print("手数模式:", (InpUseCompounding ? "复利" : "固定"),
@@ -354,9 +357,11 @@ void UpdateLatestValidWave()
 
         // 计算阈值（百分比模式：以前一个极值点价格为基准计算百分比）
         double base_price = extremes[i-1].price;
-        double threshold = (base_price * InpWavePercent / 100.0) / _Point;
+        double min_threshold = (base_price * InpMinWavePercent / 100.0) / _Point;
+        double max_threshold = (base_price * InpMaxWavePercent / 100.0) / _Point;
 
-        if(price_diff_points >= threshold) {
+        // 波段必须在最小和最大阈值之间才是有效波段
+        if(price_diff_points >= min_threshold && price_diff_points <= max_threshold) {
             extremes[i-1].is_valid = true;
             extremes[i].is_valid = true;
         }
@@ -374,9 +379,11 @@ void UpdateLatestValidWave()
 
         // 计算阈值（百分比模式）
         double base_price = extremes[i-1].price;
-        double threshold = (base_price * InpWavePercent / 100.0) / _Point;
+        double min_threshold = (base_price * InpMinWavePercent / 100.0) / _Point;
+        double max_threshold = (base_price * InpMaxWavePercent / 100.0) / _Point;
 
-        if(price_diff_points >= threshold) {
+        // 波段必须在最小和最大阈值之间才是有效波段
+        if(price_diff_points >= min_threshold && price_diff_points <= max_threshold) {
             // 找到最新的有效波段
             double high = MathMax(extremes[i].price, extremes[i-1].price);
             double low = MathMin(extremes[i].price, extremes[i-1].price);
@@ -405,7 +412,8 @@ void UpdateLatestValidWave()
                     Print("更新最新有效波段 - 高:", DoubleToString(high, _Digits),
                           " 低:", DoubleToString(low, _Digits),
                           " 价差:", (int)price_diff_points, "点",
-                          " 阈值:", StringFormat("%.2f%% (%.0f点)", InpWavePercent, threshold));
+                          " 阈值范围:", StringFormat("%.2f%%-%.2f%% (%.0f-%.0f点)",
+                                InpMinWavePercent, InpMaxWavePercent, min_threshold, max_threshold));
                 }
             }
             break;
@@ -559,7 +567,7 @@ void CheckOpenSignals()
 
     // 计算当前波段的实际阈值（百分比模式：取高低点的平均值作为基准）
     double base_price = (latest_wave.high_price + latest_wave.low_price) / 2.0;
-    double wave_threshold_points = (base_price * InpWavePercent / 100.0) / _Point;
+    double wave_threshold_points = (base_price * InpMinWavePercent / 100.0) / _Point;
 
     // 检查多单信号：突破高点（且该高点未使用过）
     if(!latest_wave.high_used && current_price > latest_wave.high_price) {
@@ -715,6 +723,10 @@ void ManagePositions()
 //+------------------------------------------------------------------+
 void CheckTrailingStop(ulong ticket)
 {
+    // 如果未开启移动止损，直接返回
+    if(!InpUseTrailingStop)
+        return;
+
     if(!PositionSelectByTicket(ticket))
         return;
 
