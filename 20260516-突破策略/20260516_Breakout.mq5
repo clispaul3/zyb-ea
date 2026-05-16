@@ -17,6 +17,7 @@ input int      InpMAPeriod = 14;                // MA周期
 input bool     InpUsePercentMode = true;        // 使用百分比模式
 input int      InpWaveThreshold = 1000;         // 波段阈值(点数/固定模式)
 input double   InpWavePercent = 0.25;           // 波段阈值(百分比/百分比模式)
+input double   InpPullbackTolerance = 0.0;      // 反向突破容忍度(%) 0=不容忍
 
 input group "=== 风险管理参数 ==="
 input int      InpStopLoss = 200;               // 止损点数
@@ -108,6 +109,10 @@ int OnInit()
         Print("波段阈值模式: 百分比 - ", InpWavePercent, "%");
     else
         Print("波段阈值模式: 固定点数 - ", InpWaveThreshold, "点");
+    if(InpPullbackTolerance > 0)
+        Print("反向突破容忍度: ", DoubleToString(InpPullbackTolerance, 1), "% (启用)");
+    else
+        Print("反向突破容忍度: 0% (禁用 - 保持原有逻辑)");
     Print("止损:", InpStopLoss, "点 | 止盈:", InpTakeProfit, "点");
     Print("最大持仓时间:", InpMaxHoldingMinutes, "分钟");
     Print("最大开仓手数:", InpMaxPositions);
@@ -193,44 +198,159 @@ void UpdateLatestValidWave()
     int filtered_types[];
     FilterBreakouts(breakout_bars, breakout_types, rates, filtered_bars, filtered_types);
 
-    // 计算极值点
+    // 计算极值点（支持反向突破容忍度）
     ExtremePoint extremes[];
     ArrayResize(extremes, 0);
 
-    for(int i = 0; i < ArraySize(filtered_bars) - 1; i++) {
-        int current_bar = filtered_bars[i];
-        int current_type = filtered_types[i];
-        int next_bar = filtered_bars[i + 1];
+    // 如果容忍度为0，使用原有逻辑（相邻突破K线之间的极值）
+    if(InpPullbackTolerance <= 0.0)
+    {
+        for(int i = 0; i < ArraySize(filtered_bars) - 1; i++) {
+            int current_bar = filtered_bars[i];
+            int current_type = filtered_types[i];
+            int next_bar = filtered_bars[i + 1];
 
-        double extreme_price = 0;
-        datetime extreme_time = 0;
+            double extreme_price = 0;
+            datetime extreme_time = 0;
 
-        if(current_type == 1) {
-            extreme_price = rates[current_bar].high;
-            extreme_time = rates[current_bar].time;
-            for(int j = current_bar; j >= next_bar; j--) {
-                if(rates[j].high > extreme_price) {
-                    extreme_price = rates[j].high;
-                    extreme_time = rates[j].time;
+            if(current_type == 1) {
+                extreme_price = rates[current_bar].high;
+                extreme_time = rates[current_bar].time;
+                for(int j = current_bar; j >= next_bar; j--) {
+                    if(rates[j].high > extreme_price) {
+                        extreme_price = rates[j].high;
+                        extreme_time = rates[j].time;
+                    }
+                }
+            } else {
+                extreme_price = rates[current_bar].low;
+                extreme_time = rates[current_bar].time;
+                for(int j = current_bar; j >= next_bar; j--) {
+                    if(rates[j].low < extreme_price) {
+                        extreme_price = rates[j].low;
+                        extreme_time = rates[j].time;
+                    }
                 }
             }
-        } else {
-            extreme_price = rates[current_bar].low;
-            extreme_time = rates[current_bar].time;
-            for(int j = current_bar; j >= next_bar; j--) {
-                if(rates[j].low < extreme_price) {
-                    extreme_price = rates[j].low;
-                    extreme_time = rates[j].time;
+
+            int size = ArraySize(extremes);
+            ArrayResize(extremes, size + 1);
+            extremes[size].time = extreme_time;
+            extremes[size].price = extreme_price;
+            extremes[size].type = current_type;
+            extremes[size].is_valid = false;
+        }
+    }
+    else
+    {
+        // 容忍模式：跨越反向突破K线计算波段
+        for(int i = 0; i < ArraySize(filtered_bars); i++) {
+            int start_bar = filtered_bars[i];
+            int start_type = filtered_types[i];
+
+            double wave_high = rates[start_bar].high;
+            double wave_low = rates[start_bar].low;
+            datetime wave_high_time = rates[start_bar].time;
+            datetime wave_low_time = rates[start_bar].time;
+            int end_bar = 0;
+            bool wave_terminated = false;
+
+            // 向后扫描，直到遇到不可容忍的反向突破
+            for(int j = i + 1; j < ArraySize(filtered_bars); j++) {
+                int current_bar = filtered_bars[j];
+                int current_type = filtered_types[j];
+
+                // 更新波段的高低点
+                if(rates[current_bar].high > wave_high) {
+                    wave_high = rates[current_bar].high;
+                    wave_high_time = rates[current_bar].time;
                 }
+                if(rates[current_bar].low < wave_low) {
+                    wave_low = rates[current_bar].low;
+                    wave_low_time = rates[current_bar].time;
+                }
+
+                // 检查中间所有K线的极值
+                int prev_bar = (j > 0) ? filtered_bars[j-1] : start_bar;
+                for(int k = prev_bar; k >= current_bar; k--) {
+                    if(rates[k].high > wave_high) {
+                        wave_high = rates[k].high;
+                        wave_high_time = rates[k].time;
+                    }
+                    if(rates[k].low < wave_low) {
+                        wave_low = rates[k].low;
+                        wave_low_time = rates[k].time;
+                    }
+                }
+
+                // 如果遇到反向突破K线，检查回撤是否可容忍
+                if(current_type != start_type) {
+                    double wave_range = wave_high - wave_low;
+                    double pullback_percent = 0;
+
+                    if(start_type == 1) {
+                        // 多头波段遇到空单突破K线
+                        pullback_percent = ((wave_high - rates[current_bar].close) / wave_range) * 100.0;
+                    } else {
+                        // 空头波段遇到多单突破K线
+                        pullback_percent = ((rates[current_bar].close - wave_low) / wave_range) * 100.0;
+                    }
+
+                    if(pullback_percent > InpPullbackTolerance) {
+                        // 回撤超过容忍度，终止波段
+                        end_bar = current_bar;
+                        wave_terminated = true;
+                        break;
+                    }
+                    // 否则继续，忽略此反向突破
+                }
+            }
+
+            // 添加极值点
+            if(start_type == 1) {
+                // 多头波段：先低点后高点
+                int size = ArraySize(extremes);
+                ArrayResize(extremes, size + 1);
+                extremes[size].time = wave_low_time;
+                extremes[size].price = wave_low;
+                extremes[size].type = -1;  // 低点
+                extremes[size].is_valid = false;
+
+                ArrayResize(extremes, size + 2);
+                extremes[size + 1].time = wave_high_time;
+                extremes[size + 1].price = wave_high;
+                extremes[size + 1].type = 1;  // 高点
+                extremes[size + 1].is_valid = false;
+            } else {
+                // 空头波段：先高点后低点
+                int size = ArraySize(extremes);
+                ArrayResize(extremes, size + 1);
+                extremes[size].time = wave_high_time;
+                extremes[size].price = wave_high;
+                extremes[size].type = 1;  // 高点
+                extremes[size].is_valid = false;
+
+                ArrayResize(extremes, size + 2);
+                extremes[size + 1].time = wave_low_time;
+                extremes[size + 1].price = wave_low;
+                extremes[size + 1].type = -1;  // 低点
+                extremes[size + 1].is_valid = false;
+            }
+
+            // 如果波段被终止，跳到终止点继续
+            if(wave_terminated) {
+                // 找到end_bar在filtered_bars中的索引
+                for(int k = i + 1; k < ArraySize(filtered_bars); k++) {
+                    if(filtered_bars[k] == end_bar) {
+                        i = k - 1;  // -1因为循环会++
+                        break;
+                    }
+                }
+            } else {
+                // 波段延续到最后
+                break;
             }
         }
-
-        int size = ArraySize(extremes);
-        ArrayResize(extremes, size + 1);
-        extremes[size].time = extreme_time;
-        extremes[size].price = extreme_price;
-        extremes[size].type = current_type;
-        extremes[size].is_valid = false;
     }
 
     // 判断有效波段并标记
