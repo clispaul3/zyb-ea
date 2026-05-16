@@ -14,14 +14,12 @@
 input group "=== 波段识别参数 ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1; // K线周期
 input int      InpMAPeriod = 14;                // MA周期
-input bool     InpUsePercentMode = true;        // 使用百分比模式
-input int      InpWaveThreshold = 1000;         // 波段阈值(点数/固定模式)
-input double   InpWavePercent = 0.25;           // 波段阈值(百分比/百分比模式)
+input double   InpWavePercent = 0.1;            // 波段阈值百分比(%)
 input double   InpPullbackTolerance = 0.0;      // 反向突破容忍度(%) 0=不容忍
 
 input group "=== 风险管理参数 ==="
-input int      InpStopLoss = 200;               // 止损点数
-input int      InpTakeProfit = 300;             // 止盈点数
+input double   InpStopLossPercent = 0.05;       // 止损百分比(%)
+input double   InpRiskRewardRatio = 1.5;        // 盈亏比
 input int      InpMaxHoldingMinutes = 5;        // 最大持仓时间(分钟)
 
 input group "=== 仓位管理参数 ==="
@@ -72,7 +70,6 @@ void CheckOpenSignals();
 bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low, double threshold_points);
 double CalculateLotSize();
 void ManagePositions();
-bool CheckTakeProfitReached(ulong ticket);
 void CheckTrailingStop(ulong ticket);
 
 //+------------------------------------------------------------------+
@@ -105,15 +102,12 @@ int OnInit()
     Print("品种:", _Symbol);
     Print("K线周期:", EnumToString(InpTimeframe));
     Print("MA周期:", InpMAPeriod);
-    if(InpUsePercentMode)
-        Print("波段阈值模式: 百分比 - ", InpWavePercent, "%");
-    else
-        Print("波段阈值模式: 固定点数 - ", InpWaveThreshold, "点");
+    Print("波段阈值: ", InpWavePercent, "%");
     if(InpPullbackTolerance > 0)
         Print("反向突破容忍度: ", DoubleToString(InpPullbackTolerance, 1), "% (启用)");
     else
         Print("反向突破容忍度: 0% (禁用 - 保持原有逻辑)");
-    Print("止损:", InpStopLoss, "点 | 止盈:", InpTakeProfit, "点");
+    Print("止损:", InpStopLossPercent, "% | 盈亏比:", InpRiskRewardRatio);
     Print("最大持仓时间:", InpMaxHoldingMinutes, "分钟");
     Print("最大开仓手数:", InpMaxPositions);
     Print("手数模式:", (InpUseCompounding ? "复利" : "固定"),
@@ -358,16 +352,9 @@ void UpdateLatestValidWave()
         double price_diff = MathAbs(extremes[i].price - extremes[i-1].price);
         double price_diff_points = price_diff / _Point;
 
-        // 计算阈值
-        double threshold = 0;
-        if(InpUsePercentMode) {
-            // 百分比模式：以前一个极值点价格为基准计算百分比
-            double base_price = extremes[i-1].price;
-            threshold = (base_price * InpWavePercent / 100.0) / _Point;
-        } else {
-            // 固定点数模式
-            threshold = InpWaveThreshold;
-        }
+        // 计算阈值（百分比模式：以前一个极值点价格为基准计算百分比）
+        double base_price = extremes[i-1].price;
+        double threshold = (base_price * InpWavePercent / 100.0) / _Point;
 
         if(price_diff_points >= threshold) {
             extremes[i-1].is_valid = true;
@@ -385,14 +372,9 @@ void UpdateLatestValidWave()
         double price_diff = MathAbs(extremes[i].price - extremes[i-1].price);
         double price_diff_points = price_diff / _Point;
 
-        // 计算阈值
-        double threshold = 0;
-        if(InpUsePercentMode) {
-            double base_price = extremes[i-1].price;
-            threshold = (base_price * InpWavePercent / 100.0) / _Point;
-        } else {
-            threshold = InpWaveThreshold;
-        }
+        // 计算阈值（百分比模式）
+        double base_price = extremes[i-1].price;
+        double threshold = (base_price * InpWavePercent / 100.0) / _Point;
 
         if(price_diff_points >= threshold) {
             // 找到最新的有效波段
@@ -420,13 +402,10 @@ void UpdateLatestValidWave()
                 }
 
                 if(InpShowDebugInfo) {
-                    string threshold_info = InpUsePercentMode ?
-                        StringFormat("%.2f%% (%.0f点)", InpWavePercent, threshold) :
-                        StringFormat("%d点", InpWaveThreshold);
                     Print("更新最新有效波段 - 高:", DoubleToString(high, _Digits),
                           " 低:", DoubleToString(low, _Digits),
                           " 价差:", (int)price_diff_points, "点",
-                          " 阈值:", threshold_info);
+                          " 阈值:", StringFormat("%.2f%% (%.0f点)", InpWavePercent, threshold));
                 }
             }
             break;
@@ -578,16 +557,9 @@ void CheckOpenSignals()
 
     double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-    // 计算当前波段的实际阈值
-    double wave_threshold_points = 0;
-    if(InpUsePercentMode) {
-        // 百分比模式：取高低点的平均值作为基准
-        double base_price = (latest_wave.high_price + latest_wave.low_price) / 2.0;
-        wave_threshold_points = (base_price * InpWavePercent / 100.0) / _Point;
-    } else {
-        // 固定点数模式
-        wave_threshold_points = InpWaveThreshold;
-    }
+    // 计算当前波段的实际阈值（百分比模式：取高低点的平均值作为基准）
+    double base_price = (latest_wave.high_price + latest_wave.low_price) / 2.0;
+    double wave_threshold_points = (base_price * InpWavePercent / 100.0) / _Point;
 
     // 检查多单信号：突破高点（且该高点未使用过）
     if(!latest_wave.high_used && current_price > latest_wave.high_price) {
@@ -627,6 +599,17 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
                           SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
                           SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
+    // 计算止损和止盈（基于开仓价的百分比）
+    double stop_loss_amount = current_price * InpStopLossPercent / 100.0;
+
+    // 确保止损金额不小于1美元（100点）
+    double min_stop_loss = 1.0;  // 1美元 = 100点
+    if(stop_loss_amount < min_stop_loss) {
+        stop_loss_amount = min_stop_loss;
+    }
+
+    double take_profit_amount = stop_loss_amount * InpRiskRewardRatio;
+
     double sl = 0, tp = 0;
     bool result = false;
 
@@ -638,24 +621,28 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
                                  threshold_points);
 
     if(order_type == ORDER_TYPE_BUY) {
-        sl = current_price - InpStopLoss * _Point;
-        tp = current_price + InpTakeProfit * _Point;
+        sl = current_price - stop_loss_amount;
+        tp = current_price + take_profit_amount;
 
         result = trade.Buy(lots, _Symbol, 0, sl, tp, comment);
         if(result) {
             Print("开多单成功 - 手数:", lots,
                   " 波段:H:", wave_high, " L:", wave_low,
-                  " 止损:", sl, " 止盈:", tp);
+                  " 开仓价:", current_price,
+                  " 止损:", sl, "(", InpStopLossPercent, "%)",
+                  " 止盈:", tp, "(盈亏比", InpRiskRewardRatio, ")");
         }
     } else {
-        sl = current_price + InpStopLoss * _Point;
-        tp = current_price - InpTakeProfit * _Point;
+        sl = current_price + stop_loss_amount;
+        tp = current_price - take_profit_amount;
 
         result = trade.Sell(lots, _Symbol, 0, sl, tp, comment);
         if(result) {
             Print("开空单成功 - 手数:", lots,
                   " 波段:H:", wave_high, " L:", wave_low,
-                  " 止损:", sl, " 止盈:", tp);
+                  " 开仓价:", current_price,
+                  " 止损:", sl, "(", InpStopLossPercent, "%)",
+                  " 止盈:", tp, "(盈亏比", InpRiskRewardRatio, ")");
         }
     }
 
@@ -717,51 +704,10 @@ void ManagePositions()
             continue;
         }
 
-        // 手动检查止盈（防止跳空未触发）
-        ulong ticket = PositionGetTicket(i);
-        if(CheckTakeProfitReached(ticket)) {
-            trade.PositionClose(ticket);
-            Print("手动止盈平仓 - Ticket:", ticket);
-            continue;
-        }
-
         // 检查移动止损
+        ulong ticket = PositionGetTicket(i);
         CheckTrailingStop(ticket);
     }
-}
-
-//+------------------------------------------------------------------+
-//| 检查是否达到止盈（防止跳空未触发）                                    |
-//+------------------------------------------------------------------+
-bool CheckTakeProfitReached(ulong ticket)
-{
-    if(!PositionSelectByTicket(ticket))
-        return false;
-
-    // 如果止盈设置为0，不检查
-    if(InpTakeProfit <= 0)
-        return false;
-
-    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    double current_price = (pos_type == POSITION_TYPE_BUY) ?
-                           SymbolInfoDouble(_Symbol, SYMBOL_BID) :
-                           SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-    // 计算浮盈点数
-    double profit_points = 0;
-    if(pos_type == POSITION_TYPE_BUY) {
-        profit_points = (current_price - open_price) / _Point;
-    } else {
-        profit_points = (open_price - current_price) / _Point;
-    }
-
-    // 检查是否达到或超过止盈点数
-    if(profit_points >= InpTakeProfit) {
-        return true;
-    }
-
-    return false;
 }
 
 //+------------------------------------------------------------------+
@@ -779,16 +725,25 @@ void CheckTrailingStop(ulong ticket)
                            SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                            SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-    // 计算浮盈点数
-    double profit_points = 0;
-    if(pos_type == POSITION_TYPE_BUY) {
-        profit_points = (current_price - open_price) / _Point;
-    } else {
-        profit_points = (open_price - current_price) / _Point;
+    // 计算止损金额（开仓价的百分比）
+    double stop_loss_amount = open_price * InpStopLossPercent / 100.0;
+
+    // 确保止损金额不小于1美元（100点）
+    double min_stop_loss = 1.0;  // 1美元 = 100点
+    if(stop_loss_amount < min_stop_loss) {
+        stop_loss_amount = min_stop_loss;
     }
 
-    // 浮盈达到止损点数，移动止损至成本价
-    if(profit_points >= InpStopLoss) {
+    // 计算浮盈
+    double profit_amount = 0;
+    if(pos_type == POSITION_TYPE_BUY) {
+        profit_amount = current_price - open_price;
+    } else {
+        profit_amount = open_price - current_price;
+    }
+
+    // 浮盈达到止损金额，移动止损至成本价
+    if(profit_amount >= stop_loss_amount) {
         double new_sl = open_price;
 
         // 检查是否需要更新
