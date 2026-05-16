@@ -1,0 +1,689 @@
+//+------------------------------------------------------------------+
+//|                                                20260516_Trade.mq5 |
+//|                                      突破交易策略 - 完整交易版本    |
+//+------------------------------------------------------------------+
+#property copyright "Breakout Strategy"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| 输入参数                                                           |
+//+------------------------------------------------------------------+
+input group "=== 波段识别参数 ==="
+input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1; // K线周期
+input int      InpMAPeriod = 14;                // MA周期
+input bool     InpUsePercentMode = true;        // 使用百分比模式
+input int      InpWaveThreshold = 1000;         // 波段阈值(点数/固定模式)
+input double   InpWavePercent = 0.25;           // 波段阈值(百分比/百分比模式)
+
+input group "=== 风险管理参数 ==="
+input int      InpStopLoss = 200;               // 止损点数
+input int      InpTakeProfit = 300;             // 止盈点数
+input int      InpMaxHoldingMinutes = 5;        // 最大持仓时间(分钟)
+
+input group "=== 仓位管理参数 ==="
+input bool     InpUseCompounding = true;        // 使用复利模式
+input double   InpFixedLots = 0.01;             // 固定手数
+input double   InpLotsPer500 = 0.05;            // 每500$开仓手数(复利模式)
+input int      InpMaxPositions = 99;            // 最大开仓手数
+
+input group "=== 调试选项 ==="
+input bool     InpShowDebugInfo = false;        // 显示调试信息
+input bool     InpShowMarkers = true;           // 显示极值点标记
+input int      InpMagicNumber = 20260516;       // EA魔术号
+
+//+------------------------------------------------------------------+
+//| 全局变量                                                           |
+//+------------------------------------------------------------------+
+int ma_handle;                                  // MA指标句柄
+CTrade trade;                                   // 交易对象
+
+// 最新有效波段信息
+struct ValidWaveInfo {
+    bool exists;                                // 是否存在有效波段
+    double high_price;                          // 高点价格
+    double low_price;                           // 低点价格
+    datetime update_time;                       // 更新时间
+    bool high_used;                             // 高点是否已使用
+    bool low_used;                              // 低点是否已使用
+};
+
+ValidWaveInfo latest_wave;                      // 最新有效波段
+
+// 极值点结构体定义
+struct ExtremePoint {
+    datetime time;
+    double price;
+    int type;
+    bool is_valid;
+};
+
+// 函数声明
+void UpdateLatestValidWave();
+void DrawExtremeMarkers(ExtremePoint &extremes[]);
+void DrawLatestValidWave(double high_price, datetime high_time, double low_price, datetime low_time);
+int CheckBreakout(int index, const MqlRates &rates[], const double &ma[]);
+void FilterBreakouts(const int &breakout_bars[], const int &breakout_types[],
+                    const MqlRates &rates[], int &filtered_bars[], int &filtered_types[]);
+void CheckOpenSignals();
+bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low, double threshold_points);
+double CalculateLotSize();
+void ManagePositions();
+bool CheckTakeProfitReached(ulong ticket);
+void CheckTrailingStop(ulong ticket);
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // 创建MA指标（使用指定的K线周期）
+    ma_handle = iMA(_Symbol, InpTimeframe, InpMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+    if(ma_handle == INVALID_HANDLE) {
+        Print("创建MA指标失败");
+        return(INIT_FAILED);
+    }
+
+    // 设置交易参数
+    trade.SetExpertMagicNumber(InpMagicNumber);
+    trade.SetDeviationInPoints(10);
+    trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+    // 初始化最新有效波段
+    latest_wave.exists = false;
+    latest_wave.high_price = 0;
+    latest_wave.low_price = 0;
+    latest_wave.update_time = 0;
+    latest_wave.high_used = false;
+    latest_wave.low_used = false;
+
+    Print("========================================");
+    Print("突破交易策略EA初始化成功");
+    Print("品种:", _Symbol);
+    Print("K线周期:", EnumToString(InpTimeframe));
+    Print("MA周期:", InpMAPeriod);
+    if(InpUsePercentMode)
+        Print("波段阈值模式: 百分比 - ", InpWavePercent, "%");
+    else
+        Print("波段阈值模式: 固定点数 - ", InpWaveThreshold, "点");
+    Print("止损:", InpStopLoss, "点 | 止盈:", InpTakeProfit, "点");
+    Print("最大持仓时间:", InpMaxHoldingMinutes, "分钟");
+    Print("最大开仓手数:", InpMaxPositions);
+    Print("手数模式:", (InpUseCompounding ? "复利" : "固定"),
+          InpUseCompounding ? StringFormat(" (每500$开%.2f手)", InpLotsPer500) : StringFormat(" (%.2f手)", InpFixedLots));
+    Print("========================================");
+
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    if(ma_handle != INVALID_HANDLE)
+        IndicatorRelease(ma_handle);
+
+    // 删除所有标记
+    ObjectsDeleteAll(0, "ValidWave_");
+
+    Print("突破交易策略EA已卸载");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // 1. 更新最新有效波段
+    UpdateLatestValidWave();
+
+    // 2. 检查开仓信号
+    CheckOpenSignals();
+
+    // 3. 管理已有持仓
+    ManagePositions();
+}
+
+//+------------------------------------------------------------------+
+//| 更新最新有效波段                                                   |
+//+------------------------------------------------------------------+
+void UpdateLatestValidWave()
+{
+    int bars = Bars(_Symbol, InpTimeframe);
+    if(bars < InpMAPeriod + 2)
+        return;
+
+    // 限制处理的K线数量
+    int process_bars = MathMin(bars, 500);
+
+    // 获取价格数据（使用指定的K线周期）
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    if(CopyRates(_Symbol, InpTimeframe, 0, process_bars, rates) <= 0)
+        return;
+
+    // 获取MA数据
+    double ma_array[];
+    ArraySetAsSeries(ma_array, true);
+    if(CopyBuffer(ma_handle, 0, 0, process_bars, ma_array) <= 0)
+        return;
+
+    // 识别突破K线
+    int breakout_bars[];
+    int breakout_types[];
+    ArrayResize(breakout_bars, 0);
+    ArrayResize(breakout_types, 0);
+
+    for(int i = process_bars - InpMAPeriod - 1; i >= 1; i--) {
+        int breakout_type = CheckBreakout(i, rates, ma_array);
+        if(breakout_type != 0) {
+            int size = ArraySize(breakout_bars);
+            ArrayResize(breakout_bars, size + 1);
+            ArrayResize(breakout_types, size + 1);
+            breakout_bars[size] = i;
+            breakout_types[size] = breakout_type;
+        }
+    }
+
+    // 过滤连续同向突破
+    int filtered_bars[];
+    int filtered_types[];
+    FilterBreakouts(breakout_bars, breakout_types, rates, filtered_bars, filtered_types);
+
+    // 计算极值点
+    ExtremePoint extremes[];
+    ArrayResize(extremes, 0);
+
+    for(int i = 0; i < ArraySize(filtered_bars) - 1; i++) {
+        int current_bar = filtered_bars[i];
+        int current_type = filtered_types[i];
+        int next_bar = filtered_bars[i + 1];
+
+        double extreme_price = 0;
+        datetime extreme_time = 0;
+
+        if(current_type == 1) {
+            extreme_price = rates[current_bar].high;
+            extreme_time = rates[current_bar].time;
+            for(int j = current_bar; j >= next_bar; j--) {
+                if(rates[j].high > extreme_price) {
+                    extreme_price = rates[j].high;
+                    extreme_time = rates[j].time;
+                }
+            }
+        } else {
+            extreme_price = rates[current_bar].low;
+            extreme_time = rates[current_bar].time;
+            for(int j = current_bar; j >= next_bar; j--) {
+                if(rates[j].low < extreme_price) {
+                    extreme_price = rates[j].low;
+                    extreme_time = rates[j].time;
+                }
+            }
+        }
+
+        int size = ArraySize(extremes);
+        ArrayResize(extremes, size + 1);
+        extremes[size].time = extreme_time;
+        extremes[size].price = extreme_price;
+        extremes[size].type = current_type;
+        extremes[size].is_valid = false;
+    }
+
+    // 判断有效波段并标记
+    for(int i = 1; i < ArraySize(extremes); i++) {
+        double price_diff = MathAbs(extremes[i].price - extremes[i-1].price);
+        double price_diff_points = price_diff / _Point;
+
+        // 计算阈值
+        double threshold = 0;
+        if(InpUsePercentMode) {
+            // 百分比模式：以前一个极值点价格为基准计算百分比
+            double base_price = extremes[i-1].price;
+            threshold = (base_price * InpWavePercent / 100.0) / _Point;
+        } else {
+            // 固定点数模式
+            threshold = InpWaveThreshold;
+        }
+
+        if(price_diff_points >= threshold) {
+            extremes[i-1].is_valid = true;
+            extremes[i].is_valid = true;
+        }
+    }
+
+    // 绘制所有极值点标记
+    if(InpShowMarkers) {
+        DrawExtremeMarkers(extremes);
+    }
+
+    // 查找最新的有效波段
+    for(int i = ArraySize(extremes) - 1; i >= 1; i--) {
+        double price_diff = MathAbs(extremes[i].price - extremes[i-1].price);
+        double price_diff_points = price_diff / _Point;
+
+        // 计算阈值
+        double threshold = 0;
+        if(InpUsePercentMode) {
+            double base_price = extremes[i-1].price;
+            threshold = (base_price * InpWavePercent / 100.0) / _Point;
+        } else {
+            threshold = InpWaveThreshold;
+        }
+
+        if(price_diff_points >= threshold) {
+            // 找到最新的有效波段
+            double high = MathMax(extremes[i].price, extremes[i-1].price);
+            double low = MathMin(extremes[i].price, extremes[i-1].price);
+            datetime high_time = (extremes[i].price > extremes[i-1].price) ? extremes[i].time : extremes[i-1].time;
+            datetime low_time = (extremes[i].price < extremes[i-1].price) ? extremes[i].time : extremes[i-1].time;
+
+            // 检查是否是新的波段
+            if(latest_wave.exists == false ||
+               extremes[i].time > latest_wave.update_time ||
+               high != latest_wave.high_price ||
+               low != latest_wave.low_price) {
+
+                latest_wave.exists = true;
+                latest_wave.high_price = high;
+                latest_wave.low_price = low;
+                latest_wave.update_time = extremes[i].time;
+                latest_wave.high_used = false;  // 新波段，重置使用状态
+                latest_wave.low_used = false;
+
+                // 绘制最新有效波段
+                if(InpShowMarkers) {
+                    DrawLatestValidWave(high, high_time, low, low_time);
+                }
+
+                if(InpShowDebugInfo) {
+                    string threshold_info = InpUsePercentMode ?
+                        StringFormat("%.2f%% (%.0f点)", InpWavePercent, threshold) :
+                        StringFormat("%d点", InpWaveThreshold);
+                    Print("更新最新有效波段 - 高:", DoubleToString(high, _Digits),
+                          " 低:", DoubleToString(low, _Digits),
+                          " 价差:", (int)price_diff_points, "点",
+                          " 阈值:", threshold_info);
+                }
+            }
+            break;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 绘制所有极值点标记                                                 |
+//+------------------------------------------------------------------+
+void DrawExtremeMarkers(ExtremePoint &extremes[])
+{
+    // 删除旧的标记
+    ObjectsDeleteAll(0, "ValidWave_Extreme_");
+
+    for(int i = 0; i < ArraySize(extremes); i++) {
+        string obj_name = "ValidWave_Extreme_" + IntegerToString(i);
+
+        if(extremes[i].type == 1) {
+            // 高点 - 画下箭头
+            ObjectCreate(0, obj_name, OBJ_ARROW, 0, extremes[i].time, extremes[i].price);
+            ObjectSetInteger(0, obj_name, OBJPROP_ARROWCODE, 234);
+            ObjectSetInteger(0, obj_name, OBJPROP_COLOR, extremes[i].is_valid ? clrRed : clrDarkRed);
+            ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, extremes[i].is_valid ? 3 : 1);
+            ObjectSetInteger(0, obj_name, OBJPROP_ANCHOR, ANCHOR_BOTTOM);
+        } else {
+            // 低点 - 画上箭头
+            ObjectCreate(0, obj_name, OBJ_ARROW, 0, extremes[i].time, extremes[i].price);
+            ObjectSetInteger(0, obj_name, OBJPROP_ARROWCODE, 233);
+            ObjectSetInteger(0, obj_name, OBJPROP_COLOR, extremes[i].is_valid ? clrLime : clrDarkGreen);
+            ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, extremes[i].is_valid ? 3 : 1);
+            ObjectSetInteger(0, obj_name, OBJPROP_ANCHOR, ANCHOR_TOP);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 绘制最新有效波段                                                   |
+//+------------------------------------------------------------------+
+void DrawLatestValidWave(double high_price, datetime high_time, double low_price, datetime low_time)
+{
+    // 删除旧的最新波段标记
+    ObjectDelete(0, "ValidWave_Latest_High");
+    ObjectDelete(0, "ValidWave_Latest_Low");
+    ObjectDelete(0, "ValidWave_Latest_Line");
+
+    // 标记最新有效波段的高点（更大更亮的箭头）
+    ObjectCreate(0, "ValidWave_Latest_High", OBJ_ARROW, 0, high_time, high_price);
+    ObjectSetInteger(0, "ValidWave_Latest_High", OBJPROP_ARROWCODE, 234);
+    ObjectSetInteger(0, "ValidWave_Latest_High", OBJPROP_COLOR, clrYellow);
+    ObjectSetInteger(0, "ValidWave_Latest_High", OBJPROP_WIDTH, 4);
+    ObjectSetInteger(0, "ValidWave_Latest_High", OBJPROP_ANCHOR, ANCHOR_BOTTOM);
+
+    // 标记最新有效波段的低点
+    ObjectCreate(0, "ValidWave_Latest_Low", OBJ_ARROW, 0, low_time, low_price);
+    ObjectSetInteger(0, "ValidWave_Latest_Low", OBJPROP_ARROWCODE, 233);
+    ObjectSetInteger(0, "ValidWave_Latest_Low", OBJPROP_COLOR, clrYellow);
+    ObjectSetInteger(0, "ValidWave_Latest_Low", OBJPROP_WIDTH, 4);
+    ObjectSetInteger(0, "ValidWave_Latest_Low", OBJPROP_ANCHOR, ANCHOR_TOP);
+
+    // 绘制连接线
+    ObjectCreate(0, "ValidWave_Latest_Line", OBJ_TREND, 0, high_time, high_price, low_time, low_price);
+    ObjectSetInteger(0, "ValidWave_Latest_Line", OBJPROP_COLOR, clrYellow);
+    ObjectSetInteger(0, "ValidWave_Latest_Line", OBJPROP_WIDTH, 2);
+    ObjectSetInteger(0, "ValidWave_Latest_Line", OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, "ValidWave_Latest_Line", OBJPROP_RAY_RIGHT, false);
+    ObjectSetInteger(0, "ValidWave_Latest_Line", OBJPROP_BACK, true);
+}
+
+//+------------------------------------------------------------------+
+//| 检查是否是突破K线                                                  |
+//+------------------------------------------------------------------+
+int CheckBreakout(int index, const MqlRates &rates[], const double &ma[])
+{
+    if(rates[index].open < ma[index] && rates[index].close > ma[index])
+        return 1;
+    if(rates[index].open > ma[index] && rates[index].close < ma[index])
+        return -1;
+    return 0;
+}
+
+//+------------------------------------------------------------------+
+//| 过滤连续同向突破                                                   |
+//+------------------------------------------------------------------+
+void FilterBreakouts(const int &breakout_bars[], const int &breakout_types[],
+                    const MqlRates &rates[], int &filtered_bars[], int &filtered_types[])
+{
+    int total = ArraySize(breakout_bars);
+    ArrayResize(filtered_bars, 0);
+    ArrayResize(filtered_types, 0);
+
+    for(int i = 0; i < total; i++) {
+        int current_bar = breakout_bars[i];
+        int current_type = breakout_types[i];
+
+        bool skip = false;
+        for(int j = i + 1; j < total; j++) {
+            if(breakout_types[j] != current_type)
+                break;
+
+            if(current_type == 1) {
+                if(rates[breakout_bars[j]].low < rates[current_bar].low) {
+                    skip = true;
+                    break;
+                }
+            } else {
+                if(rates[breakout_bars[j]].high > rates[current_bar].high) {
+                    skip = true;
+                    break;
+                }
+            }
+        }
+
+        if(!skip) {
+            int size = ArraySize(filtered_bars);
+            ArrayResize(filtered_bars, size + 1);
+            ArrayResize(filtered_types, size + 1);
+            filtered_bars[size] = current_bar;
+            filtered_types[size] = current_type;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 检查开仓信号                                                       |
+//+------------------------------------------------------------------+
+void CheckOpenSignals()
+{
+    if(!latest_wave.exists)
+        return;
+
+    // 检查当前持仓数量是否已达上限
+    int total_positions = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+        total_positions++;
+    }
+
+    if(total_positions >= InpMaxPositions) {
+        if(InpShowDebugInfo)
+            Print("已达最大持仓数量限制: ", total_positions, "/", InpMaxPositions);
+        return;
+    }
+
+    double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    // 计算当前波段的实际阈值
+    double wave_threshold_points = 0;
+    if(InpUsePercentMode) {
+        // 百分比模式：取高低点的平均值作为基准
+        double base_price = (latest_wave.high_price + latest_wave.low_price) / 2.0;
+        wave_threshold_points = (base_price * InpWavePercent / 100.0) / _Point;
+    } else {
+        // 固定点数模式
+        wave_threshold_points = InpWaveThreshold;
+    }
+
+    // 检查多单信号：突破高点（且该高点未使用过）
+    if(!latest_wave.high_used && current_price > latest_wave.high_price) {
+        if(InpShowDebugInfo)
+            Print("检测到多单信号 - 价格:", current_price, " 突破高点:", latest_wave.high_price);
+
+        if(OpenPosition(ORDER_TYPE_BUY, latest_wave.high_price, latest_wave.low_price, wave_threshold_points)) {
+            latest_wave.high_used = true;  // 标记高点已使用，该波段高点失效
+            if(InpShowDebugInfo)
+                Print("高点已使用，等待新的有效波段");
+        }
+    }
+
+    // 检查空单信号：突破低点（且该低点未使用过）
+    if(!latest_wave.low_used && current_price < latest_wave.low_price) {
+        if(InpShowDebugInfo)
+            Print("检测到空单信号 - 价格:", current_price, " 突破低点:", latest_wave.low_price);
+
+        if(OpenPosition(ORDER_TYPE_SELL, latest_wave.high_price, latest_wave.low_price, wave_threshold_points)) {
+            latest_wave.low_used = true;  // 标记低点已使用，该波段低点失效
+            if(InpShowDebugInfo)
+                Print("低点已使用，等待新的有效波段");
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 开仓                                                               |
+//+------------------------------------------------------------------+
+bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low, double threshold_points)
+{
+    double lots = CalculateLotSize();
+    if(lots <= 0)
+        return false;
+
+    double current_price = (order_type == ORDER_TYPE_BUY) ?
+                          SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
+                          SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    double sl = 0, tp = 0;
+    bool result = false;
+
+    // 生成包含有效波段信息的注释
+    string comment = StringFormat("%s H%.0f L%.0f T%.0f",
+                                 (order_type == ORDER_TYPE_BUY ? "B" : "S"),
+                                 wave_high,
+                                 wave_low,
+                                 threshold_points);
+
+    if(order_type == ORDER_TYPE_BUY) {
+        sl = current_price - InpStopLoss * _Point;
+        tp = current_price + InpTakeProfit * _Point;
+
+        result = trade.Buy(lots, _Symbol, 0, sl, tp, comment);
+        if(result) {
+            Print("开多单成功 - 手数:", lots,
+                  " 波段:H:", wave_high, " L:", wave_low,
+                  " 止损:", sl, " 止盈:", tp);
+        }
+    } else {
+        sl = current_price + InpStopLoss * _Point;
+        tp = current_price - InpTakeProfit * _Point;
+
+        result = trade.Sell(lots, _Symbol, 0, sl, tp, comment);
+        if(result) {
+            Print("开空单成功 - 手数:", lots,
+                  " 波段:H:", wave_high, " L:", wave_low,
+                  " 止损:", sl, " 止盈:", tp);
+        }
+    }
+
+    return result;
+}
+
+//+------------------------------------------------------------------+
+//| 计算开仓手数                                                       |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+    double lots = 0;
+
+    if(InpUseCompounding) {
+        // 复利模式
+        double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+        lots = NormalizeDouble((balance / 500.0) * InpLotsPer500, 2);
+    } else {
+        // 固定手数模式
+        lots = InpFixedLots;
+    }
+
+    // 检查手数限制
+    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+    if(lots < min_lot) lots = min_lot;
+    if(lots > max_lot) lots = max_lot;
+
+    lots = MathFloor(lots / lot_step) * lot_step;
+
+    return lots;
+}
+
+//+------------------------------------------------------------------+
+//| 管理持仓                                                           |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+
+        // 检查最大持仓时间
+        datetime open_time = (datetime)PositionGetInteger(POSITION_TIME);
+        int holding_minutes = (int)((TimeCurrent() - open_time) / 60);
+
+        if(holding_minutes >= InpMaxHoldingMinutes) {
+            ulong ticket = PositionGetTicket(i);
+            trade.PositionClose(ticket);
+            Print("持仓时间超限，平仓 - Ticket:", ticket, " 持仓时长:", holding_minutes, "分钟");
+            continue;
+        }
+
+        // 手动检查止盈（防止跳空未触发）
+        ulong ticket = PositionGetTicket(i);
+        if(CheckTakeProfitReached(ticket)) {
+            trade.PositionClose(ticket);
+            Print("手动止盈平仓 - Ticket:", ticket);
+            continue;
+        }
+
+        // 检查移动止损
+        CheckTrailingStop(ticket);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 检查是否达到止盈（防止跳空未触发）                                    |
+//+------------------------------------------------------------------+
+bool CheckTakeProfitReached(ulong ticket)
+{
+    if(!PositionSelectByTicket(ticket))
+        return false;
+
+    // 如果止盈设置为0，不检查
+    if(InpTakeProfit <= 0)
+        return false;
+
+    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double current_price = (pos_type == POSITION_TYPE_BUY) ?
+                           SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                           SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    // 计算浮盈点数
+    double profit_points = 0;
+    if(pos_type == POSITION_TYPE_BUY) {
+        profit_points = (current_price - open_price) / _Point;
+    } else {
+        profit_points = (open_price - current_price) / _Point;
+    }
+
+    // 检查是否达到或超过止盈点数
+    if(profit_points >= InpTakeProfit) {
+        return true;
+    }
+
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| 检查移动止损                                                       |
+//+------------------------------------------------------------------+
+void CheckTrailingStop(ulong ticket)
+{
+    if(!PositionSelectByTicket(ticket))
+        return;
+
+    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+    double current_sl = PositionGetDouble(POSITION_SL);
+    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double current_price = (pos_type == POSITION_TYPE_BUY) ?
+                           SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                           SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    // 计算浮盈点数
+    double profit_points = 0;
+    if(pos_type == POSITION_TYPE_BUY) {
+        profit_points = (current_price - open_price) / _Point;
+    } else {
+        profit_points = (open_price - current_price) / _Point;
+    }
+
+    // 浮盈达到止损点数，移动止损至成本价
+    if(profit_points >= InpStopLoss) {
+        double new_sl = open_price;
+
+        // 检查是否需要更新
+        bool need_update = false;
+        if(pos_type == POSITION_TYPE_BUY && (current_sl < new_sl || current_sl == 0)) {
+            need_update = true;
+        } else if(pos_type == POSITION_TYPE_SELL && (current_sl > new_sl || current_sl == 0)) {
+            need_update = true;
+        }
+
+        if(need_update) {
+            double tp = PositionGetDouble(POSITION_TP);
+            if(trade.PositionModify(ticket, new_sl, tp)) {
+                Print("移动止损至成本价 - Ticket:", ticket, " 新止损:", new_sl);
+            }
+        }
+    }
+}
