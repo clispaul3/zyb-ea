@@ -19,9 +19,9 @@ input double   InpMaxWavePercent = 1.0;         // 最大波段阈值百分比(%
 input double   InpPullbackTolerance = 0.0;      // 反向突破容忍度(%) 0=不容忍
 
 input group "=== 风险管理参数 ==="
-input double   InpStopLossPercent = 0.05;       // 止损百分比(%)
-input int      InpMinStopLossPoints = 100;      // 最小止损点数
-input double   InpRiskRewardRatio = 1.5;        // 盈亏比
+input double   InpStopLossPercent = 0.02;       // 止损百分比(%)
+input int      InpMinStopLossPoints = 10;       // 最小止损点数
+input double   InpRiskRewardRatio = 1.2;        // 盈亏比
 input bool     InpUseTrailingStop = false;      // 使用移动止损
 input int      InpMaxHoldingMinutes = 5;        // 最大持仓时间(分钟)
 
