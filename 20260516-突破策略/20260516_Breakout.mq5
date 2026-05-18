@@ -23,7 +23,6 @@ input double   InpStopLossPercent = 0.02;       // 止损百分比(%)
 input int      InpMinStopLossPoints = 10;       // 最小止损点数
 input double   InpRiskRewardRatio = 1.2;        // 盈亏比
 input bool     InpUseTrailingStop = false;      // 使用移动止损
-input int      InpMaxHoldingMinutes = 5;        // 最大持仓时间(分钟)
 
 input group "=== 仓位管理参数 ==="
 input bool     InpUseCompounding = true;        // 使用复利模式
@@ -40,6 +39,7 @@ input group "=== 调试选项 ==="
 input bool     InpShowDebugInfo = false;        // 显示调试信息
 input bool     InpShowMarkers = true;           // 显示极值点标记
 input int      InpMagicNumber = 20260516;       // EA魔术号
+input bool     InpCloseManualOrders = true;     // 禁止手工单(自动平掉)
 
 //+------------------------------------------------------------------+
 //| 全局变量                                                           |
@@ -84,6 +84,7 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
 double CalculateLotSize();
 void ManagePositions();
 void CheckTrailingStop(ulong ticket);
+void CheckAndCloseManualOrders();
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -122,7 +123,6 @@ int OnInit()
         Print("反向突破容忍度: 0% (禁用 - 保持原有逻辑)");
     Print("止损:", InpStopLossPercent, "% (最小", InpMinStopLossPoints, "点) | 盈亏比:", InpRiskRewardRatio);
     Print("移动止损:", (InpUseTrailingStop ? "启用" : "禁用"));
-    Print("最大持仓时间:", InpMaxHoldingMinutes, "分钟");
     Print("最大开仓手数:", InpMaxPositions);
     Print("单方向持仓限制:", (InpOnePositionPerDirection ? "启用 (每方向最多1单)" : "禁用"));
     if(InpConsecutiveLosses > 0 && InpFreezeBarCount > 0)
@@ -131,6 +131,7 @@ int OnInit()
         Print("连续亏损保护: 禁用");
     Print("手数模式:", (InpUseCompounding ? "复利" : "固定"),
           InpUseCompounding ? StringFormat(" (每500$开%.2f手)", InpLotsPer500) : StringFormat(" (%.2f手)", InpFixedLots));
+    Print("禁止手工单:", (InpCloseManualOrders ? "启用 (自动平掉手工单)" : "禁用"));
     Print("========================================");
 
     return(INIT_SUCCEEDED);
@@ -228,13 +229,17 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    // 1. 更新最新有效波段
+    // 1. 检查并关闭手工单（如果启用）
+    if(InpCloseManualOrders)
+        CheckAndCloseManualOrders();
+
+    // 2. 更新最新有效波段
     UpdateLatestValidWave();
 
-    // 2. 检查开仓信号
+    // 3. 检查开仓信号
     CheckOpenSignals();
 
-    // 3. 管理已有持仓
+    // 4. 管理已有持仓
     ManagePositions();
 }
 
@@ -835,17 +840,6 @@ void ManagePositions()
         if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
             continue;
 
-        // 检查最大持仓时间
-        datetime open_time = (datetime)PositionGetInteger(POSITION_TIME);
-        int holding_minutes = (int)((TimeCurrent() - open_time) / 60);
-
-        if(holding_minutes >= InpMaxHoldingMinutes) {
-            ulong ticket = PositionGetTicket(i);
-            trade.PositionClose(ticket);
-            Print("持仓时间超限，平仓 - Ticket:", ticket, " 持仓时长:", holding_minutes, "分钟");
-            continue;
-        }
-
         // 检查移动止损
         ulong ticket = PositionGetTicket(i);
         CheckTrailingStop(ticket);
@@ -904,6 +898,35 @@ void CheckTrailingStop(ulong ticket)
             double tp = PositionGetDouble(POSITION_TP);
             if(trade.PositionModify(ticket, new_sl, tp)) {
                 Print("移动止损至成本价 - Ticket:", ticket, " 新止损:", new_sl);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 检查并关闭手工单                                                   |
+//+------------------------------------------------------------------+
+void CheckAndCloseManualOrders()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+
+        // 只处理本品种
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+
+        // 检查magic number：0表示手工单
+        long magic = PositionGetInteger(POSITION_MAGIC);
+        if(magic == 0) {
+            ulong ticket = PositionGetTicket(i);
+
+            // 平仓手工单
+            if(trade.PositionClose(ticket)) {
+                Print("【禁止手工单】已平掉手工单 - Ticket:", ticket,
+                      " 类型:", (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "多单" : "空单"));
+            } else {
+                Print("【禁止手工单】平仓失败 - Ticket:", ticket, " 错误:", GetLastError());
             }
         }
     }
