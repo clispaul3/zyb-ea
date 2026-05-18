@@ -763,23 +763,35 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
         return false;
     }
 
-    // 获取刚刚开仓的订单ticket
-    ulong ticket = trade.ResultOrder();
-    if(ticket == 0) {
-        ticket = trade.ResultDeal();
-    }
-
     // 等待持仓信息更新
     Sleep(100);
 
-    // 选择该持仓
-    if(!PositionSelectByTicket(ticket)) {
-        Print("无法选择持仓 ticket:", ticket);
-        return false;
+    // 通过符号和魔术号查找刚开的持仓
+    ulong ticket = 0;
+    double open_price = 0;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+
+        // 找到最新的持仓（没有SL/TP的）
+        if(PositionGetDouble(POSITION_SL) == 0 && PositionGetDouble(POSITION_TP) == 0) {
+            ticket = PositionGetTicket(i);
+            open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            break;
+        }
     }
 
-    // 获取实际成交价
-    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+    if(ticket == 0) {
+        Print("无法找到刚开的持仓");
+        return false;
+    }
 
     // 基于实际成交价计算止损金额
     double stop_loss_amount = open_price * InpStopLossPercent / 100.0;
@@ -790,6 +802,14 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
         stop_loss_amount = min_stop_loss;
     }
 
+    // 获取平台的最小止损距离
+    int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    double min_stop_distance = stops_level * _Point;
+
+    // 获取当前市场价格
+    double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
     double sl = 0, tp = 0;
 
     if(order_type == ORDER_TYPE_BUY) {
@@ -799,6 +819,22 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
         double actual_sl_amount = open_price - sl;
         double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
         tp = NormalizeDouble(open_price + take_profit_amount, _Digits);
+
+        // 检查止损距离（多单检查与Bid的距离）
+        if(stops_level > 0 && (current_bid - sl) < min_stop_distance) {
+            sl = NormalizeDouble(current_bid - min_stop_distance, _Digits);
+            // 重新计算止盈
+            actual_sl_amount = open_price - sl;
+            take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
+            tp = NormalizeDouble(open_price + take_profit_amount, _Digits);
+            Print("止损距离不足，已调整 - 新止损:", sl);
+        }
+
+        // 检查止盈距离
+        if(stops_level > 0 && (tp - current_ask) < min_stop_distance) {
+            tp = NormalizeDouble(current_ask + min_stop_distance, _Digits);
+            Print("止盈距离不足，已调整 - 新止盈:", tp);
+        }
     } else {
         // 先标准化止损价
         sl = NormalizeDouble(open_price + stop_loss_amount, _Digits);
@@ -806,11 +842,31 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
         double actual_sl_amount = sl - open_price;
         double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
         tp = NormalizeDouble(open_price - take_profit_amount, _Digits);
+
+        // 检查止损距离（空单检查与Ask的距离）
+        if(stops_level > 0 && (sl - current_ask) < min_stop_distance) {
+            sl = NormalizeDouble(current_ask + min_stop_distance, _Digits);
+            // 重新计算止盈
+            actual_sl_amount = sl - open_price;
+            take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
+            tp = NormalizeDouble(open_price - take_profit_amount, _Digits);
+            Print("止损距离不足，已调整 - 新止损:", sl);
+        }
+
+        // 检查止盈距离
+        if(stops_level > 0 && (current_bid - tp) < min_stop_distance) {
+            tp = NormalizeDouble(current_bid - min_stop_distance, _Digits);
+            Print("止盈距离不足，已调整 - 新止盈:", tp);
+        }
     }
 
     // 修改持仓的SL/TP
     if(!trade.PositionModify(ticket, sl, tp)) {
-        Print("修改SL/TP失败: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+        Print("修改SL/TP失败 - Ticket:", ticket,
+              " 错误码:", trade.ResultRetcode(),
+              " 描述:", trade.ResultRetcodeDescription(),
+              " 止损:", sl, " 止盈:", tp,
+              " 平台最小距离:", stops_level, "点");
         return false;
     }
 
