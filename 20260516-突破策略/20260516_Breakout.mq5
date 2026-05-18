@@ -755,8 +755,6 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
         stop_loss_amount = min_stop_loss;
     }
 
-    double take_profit_amount = stop_loss_amount * InpRiskRewardRatio;
-
     double sl = 0, tp = 0;
     bool result = false;
 
@@ -768,8 +766,12 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
                                  threshold_points);
 
     if(order_type == ORDER_TYPE_BUY) {
-        sl = current_price - stop_loss_amount;
-        tp = current_price + take_profit_amount;
+        // 先标准化止损价
+        sl = NormalizeDouble(current_price - stop_loss_amount, _Digits);
+        // 根据标准化后的实际止损金额重新计算止盈金额，确保盈亏比准确
+        double actual_sl_amount = current_price - sl;
+        double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
+        tp = NormalizeDouble(current_price + take_profit_amount, _Digits);
 
         result = trade.Buy(lots, _Symbol, 0, sl, tp, comment);
         if(result) {
@@ -780,8 +782,12 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
                   " 止盈:", tp, "(盈亏比", InpRiskRewardRatio, ")");
         }
     } else {
-        sl = current_price + stop_loss_amount;
-        tp = current_price - take_profit_amount;
+        // 先标准化止损价
+        sl = NormalizeDouble(current_price + stop_loss_amount, _Digits);
+        // 根据标准化后的实际止损金额重新计算止盈金额，确保盈亏比准确
+        double actual_sl_amount = sl - current_price;
+        double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
+        tp = NormalizeDouble(current_price - take_profit_amount, _Digits);
 
         result = trade.Sell(lots, _Symbol, 0, sl, tp, comment);
         if(result) {
