@@ -742,12 +742,47 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
     if(lots <= 0)
         return false;
 
-    double current_price = (order_type == ORDER_TYPE_BUY) ?
-                          SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
-                          SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    // 生成包含有效波段信息的注释
+    string comment = StringFormat("%s H%.0f L%.0f T%.0f",
+                                 (order_type == ORDER_TYPE_BUY ? "B" : "S"),
+                                 wave_high,
+                                 wave_low,
+                                 threshold_points);
 
-    // 计算止损和止盈（基于开仓价的百分比）
-    double stop_loss_amount = current_price * InpStopLossPercent / 100.0;
+    bool result = false;
+
+    // 先以市价开仓（不带SL/TP），成交后再根据实际成交价设置SL/TP
+    if(order_type == ORDER_TYPE_BUY) {
+        result = trade.Buy(lots, _Symbol, 0, 0, 0, comment);
+    } else {
+        result = trade.Sell(lots, _Symbol, 0, 0, 0, comment);
+    }
+
+    if(!result) {
+        Print("开仓失败: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+        return false;
+    }
+
+    // 获取刚刚开仓的订单ticket
+    ulong ticket = trade.ResultOrder();
+    if(ticket == 0) {
+        ticket = trade.ResultDeal();
+    }
+
+    // 等待持仓信息更新
+    Sleep(100);
+
+    // 选择该持仓
+    if(!PositionSelectByTicket(ticket)) {
+        Print("无法选择持仓 ticket:", ticket);
+        return false;
+    }
+
+    // 获取实际成交价
+    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+
+    // 基于实际成交价计算止损金额
+    double stop_loss_amount = open_price * InpStopLossPercent / 100.0;
 
     // 确保止损金额不小于最小止损点数
     double min_stop_loss = InpMinStopLossPoints * _Point;
@@ -756,50 +791,37 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
     }
 
     double sl = 0, tp = 0;
-    bool result = false;
-
-    // 生成包含有效波段信息的注释
-    string comment = StringFormat("%s H%.0f L%.0f T%.0f",
-                                 (order_type == ORDER_TYPE_BUY ? "B" : "S"),
-                                 wave_high,
-                                 wave_low,
-                                 threshold_points);
 
     if(order_type == ORDER_TYPE_BUY) {
         // 先标准化止损价
-        sl = NormalizeDouble(current_price - stop_loss_amount, _Digits);
+        sl = NormalizeDouble(open_price - stop_loss_amount, _Digits);
         // 根据标准化后的实际止损金额重新计算止盈金额，确保盈亏比准确
-        double actual_sl_amount = current_price - sl;
+        double actual_sl_amount = open_price - sl;
         double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
-        tp = NormalizeDouble(current_price + take_profit_amount, _Digits);
-
-        result = trade.Buy(lots, _Symbol, 0, sl, tp, comment);
-        if(result) {
-            Print("开多单成功 - 手数:", lots,
-                  " 波段:H:", wave_high, " L:", wave_low,
-                  " 开仓价:", current_price,
-                  " 止损:", sl, "(", InpStopLossPercent, "%)",
-                  " 止盈:", tp, "(盈亏比", InpRiskRewardRatio, ")");
-        }
+        tp = NormalizeDouble(open_price + take_profit_amount, _Digits);
     } else {
         // 先标准化止损价
-        sl = NormalizeDouble(current_price + stop_loss_amount, _Digits);
+        sl = NormalizeDouble(open_price + stop_loss_amount, _Digits);
         // 根据标准化后的实际止损金额重新计算止盈金额，确保盈亏比准确
-        double actual_sl_amount = sl - current_price;
+        double actual_sl_amount = sl - open_price;
         double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
-        tp = NormalizeDouble(current_price - take_profit_amount, _Digits);
-
-        result = trade.Sell(lots, _Symbol, 0, sl, tp, comment);
-        if(result) {
-            Print("开空单成功 - 手数:", lots,
-                  " 波段:H:", wave_high, " L:", wave_low,
-                  " 开仓价:", current_price,
-                  " 止损:", sl, "(", InpStopLossPercent, "%)",
-                  " 止盈:", tp, "(盈亏比", InpRiskRewardRatio, ")");
-        }
+        tp = NormalizeDouble(open_price - take_profit_amount, _Digits);
     }
 
-    return result;
+    // 修改持仓的SL/TP
+    if(!trade.PositionModify(ticket, sl, tp)) {
+        Print("修改SL/TP失败: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+        return false;
+    }
+
+    Print(order_type == ORDER_TYPE_BUY ? "开多单成功" : "开空单成功",
+          " - 手数:", lots,
+          " 波段:H:", wave_high, " L:", wave_low,
+          " 实际成交价:", open_price,
+          " 止损:", sl, "(", InpStopLossPercent, "%)",
+          " 止盈:", tp, "(盈亏比", InpRiskRewardRatio, ")");
+
+    return true;
 }
 
 //+------------------------------------------------------------------+
