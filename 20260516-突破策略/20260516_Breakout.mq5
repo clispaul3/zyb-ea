@@ -742,12 +742,10 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
     if(lots <= 0)
         return false;
 
-    // 生成包含有效波段信息的注释
-    string comment = StringFormat("%s H%.0f L%.0f T%.0f",
-                                 (order_type == ORDER_TYPE_BUY ? "B" : "S"),
-                                 wave_high,
-                                 wave_low,
-                                 threshold_points);
+    // 生成备注信息：盈亏比和最小止损点数
+    string comment = StringFormat("R%.1f SL%d",
+                                 InpRiskRewardRatio,
+                                 InpMinStopLossPoints);
 
     bool result = false;
 
