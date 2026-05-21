@@ -35,6 +35,14 @@ input group "=== 连续亏损保护 ==="
 input int      InpConsecutiveLosses = 3;        // 连续亏损次数触发冷冻(0=禁用)
 input int      InpFreezeBarCount = 60;          // 冷冻K线根数(0=禁用)
 
+input group "=== 补偿机制参数 ==="
+input bool     InpEnableCompensation = true;    // 启用补偿机制
+input int      InpMinCompensationQueueSize = 1; // 补偿队列最小长度(>=此值才开补偿单)
+input double   InpMaxCompensationLots = 5.0;    // 补偿单最大手数
+input int      InpCompensationStopLossPips = 100; // 补偿单止损点数
+input int      InpMaxCompensationTakeProfitPips = 300; // 补偿单最大止盈点数
+input int      InpMaxConsecutiveCompensations = 5; // 连续补偿次数限制(超过则重置)
+
 input group "=== 调试选项 ==="
 input bool     InpShowDebugInfo = false;        // 显示调试信息
 input bool     InpShowMarkers = true;           // 显示极值点标记
@@ -72,6 +80,22 @@ struct ExtremePoint {
     bool is_valid;
 };
 
+// 补偿队列项结构体定义
+struct CompensationItem {
+    int ticket;           // 订单号
+    double loss;          // 亏损金额（正数，美元）
+    double lots;          // 手数
+    double stopLossAmount;// 止损金额（正数，美元）
+    int direction;        // 方向（1=多单，-1=空单）
+    datetime closeTime;   // 平仓时间
+};
+
+// 补偿机制全局变量
+CompensationItem g_compensationQueue[];         // 补偿队列（待处理）
+CompensationItem g_currentCompensationSnapshot[];// 当前补偿单对应的队列快照
+int g_currentCompensationTicket = -1;           // 当前补偿单ticket（-1表示无补偿单）
+int g_consecutiveCompensationCount = 0;         // 连续补偿计数器
+
 // 函数声明
 void UpdateLatestValidWave();
 void DrawExtremeMarkers(ExtremePoint &extremes[]);
@@ -85,6 +109,12 @@ double CalculateLotSize();
 void ManagePositions();
 void CheckTrailingStop(ulong ticket);
 void CheckAndCloseManualOrders();
+
+// 补偿机制函数声明
+void AddToCompensationQueue(ulong ticket);
+bool OpenCompensationOrder();
+void CheckCompensationOrderStatus();
+void ClearCompensationQueue();
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -132,6 +162,14 @@ int OnInit()
     Print("手数模式:", (InpUseCompounding ? "复利" : "固定"),
           InpUseCompounding ? StringFormat(" (每500$开%.2f手)", InpLotsPer500) : StringFormat(" (%.2f手)", InpFixedLots));
     Print("禁止手工单:", (InpCloseManualOrders ? "启用 (自动平掉手工单)" : "禁用"));
+    if(InpEnableCompensation)
+        Print("补偿机制: 启用 (队列最小长度:", InpMinCompensationQueueSize,
+              " 最大手数:", InpMaxCompensationLots,
+              " 止损:", InpCompensationStopLossPips, "点",
+              " 最大止盈:", InpMaxCompensationTakeProfitPips, "点",
+              " 连续限制:", InpMaxConsecutiveCompensations, "次)");
+    else
+        Print("补偿机制: 禁用");
     Print("========================================");
 
     return(INIT_SUCCEEDED);
@@ -195,31 +233,65 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     double swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
     double net_profit = profit + commission + swap;
 
-    // 判断是亏损还是盈利
-    if(net_profit < 0)
+    // 获取持仓ID用于补偿机制
+    long position_id = HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
+
+    // 获取平仓原因
+    ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+
+    // 判断是亏损还是盈利（基于是否触发止损）
+    if(reason == DEAL_REASON_SL)
     {
-        // 亏损：增加计数器
-        consecutive_loss_count++;
-        Print("【连续亏损保护】亏损 ", consecutive_loss_count, "/", InpConsecutiveLosses,
-              " | 净亏损: $", DoubleToString(net_profit, 2));
+        // 检查是否是补偿单（补偿单不计入连续亏损统计）
+        string comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
+        bool is_compensation = (StringFind(comment, "[补偿单]") >= 0);
 
-        // 检查是否达到冷冻阈值
-        if(consecutive_loss_count >= InpConsecutiveLosses)
+        if(!is_compensation)
         {
-            // 进入冷冻期
-            freeze_bar_index = Bars(_Symbol, InpTimeframe) + InpFreezeBarCount;
-            freeze_until_time = TimeCurrent();
+            // 只有正常单亏损才增加计数器
+            consecutive_loss_count++;
+            Print("【连续亏损保护】正常单亏损 ", consecutive_loss_count, "/", InpConsecutiveLosses,
+                  " | 净亏损: $", DoubleToString(net_profit, 2));
 
-            Print("!!! 触发交易冷冻 !!! 冷冻", InpFreezeBarCount, "根K线");
+            // 检查是否达到冷冻阈值
+            if(consecutive_loss_count >= InpConsecutiveLosses)
+            {
+                // 进入冷冻期
+                freeze_bar_index = Bars(_Symbol, InpTimeframe) + InpFreezeBarCount;
+                freeze_until_time = TimeCurrent();
+
+                Print("!!! 触发交易冷冻 !!! 冷冻", InpFreezeBarCount, "根K线");
+            }
+        }
+        else
+        {
+            Print("【补偿机制】补偿单亏损 - 不计入连续亏损统计 | 净亏损: $", DoubleToString(net_profit, 2));
+        }
+
+        // 补偿机制：将亏损单加入补偿队列（正常单和补偿单都加入）
+        if(InpEnableCompensation)
+        {
+            AddToCompensationQueue(position_id);
         }
     }
-    else if(net_profit > 0)
+    else if(reason == DEAL_REASON_TP)
     {
-        // 盈利：重置计数器
-        if(consecutive_loss_count > 0)
+        // 检查是否是补偿单
+        string comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
+        bool is_compensation = (StringFind(comment, "[补偿单]") >= 0);
+
+        if(!is_compensation)
         {
-            Print("【连续亏损保护】盈利 - 计数器重置: ", consecutive_loss_count, " → 0 | 净盈利: $", DoubleToString(net_profit, 2));
-            consecutive_loss_count = 0;
+            // 只有正常单盈利才重置计数器
+            if(consecutive_loss_count > 0)
+            {
+                Print("【连续亏损保护】正常单止盈 - 计数器重置: ", consecutive_loss_count, " → 0 | 净盈利: $", DoubleToString(net_profit, 2));
+                consecutive_loss_count = 0;
+            }
+        }
+        else
+        {
+            Print("【补偿机制】补偿单止盈 - 不影响连续亏损计数器 | 净盈利: $", DoubleToString(net_profit, 2));
         }
     }
 }
@@ -233,13 +305,17 @@ void OnTick()
     if(InpCloseManualOrders)
         CheckAndCloseManualOrders();
 
-    // 2. 更新最新有效波段
+    // 2. 检查补偿单状态（优先处理补偿机制）
+    if(InpEnableCompensation)
+        CheckCompensationOrderStatus();
+
+    // 3. 更新最新有效波段
     UpdateLatestValidWave();
 
-    // 3. 检查开仓信号
+    // 4. 检查开仓信号
     CheckOpenSignals();
 
-    // 4. 管理已有持仓
+    // 5. 管理已有持仓
     ManagePositions();
 }
 
@@ -742,10 +818,8 @@ bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
     if(lots <= 0)
         return false;
 
-    // 生成备注信息：盈亏比和最小止损点数
-    string comment = StringFormat("R%.1f SL%d",
-                                 InpRiskRewardRatio,
-                                 InpMinStopLossPoints);
+    // 生成备注信息：盈亏比（止损点数会在设置SL后从历史记录计算）
+    string comment = StringFormat("R%.1f", InpRiskRewardRatio);
 
     bool result = false;
 
@@ -940,6 +1014,11 @@ void CheckTrailingStop(ulong ticket)
     if(!PositionSelectByTicket(ticket))
         return;
 
+    // 补偿单不使用移动止损（需要达到完整止盈目标）
+    string comment = PositionGetString(POSITION_COMMENT);
+    if(StringFind(comment, "[补偿单]") >= 0)
+        return;
+
     double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
     double current_sl = PositionGetDouble(POSITION_SL);
     ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
@@ -1012,4 +1091,465 @@ void CheckAndCloseManualOrders()
             }
         }
     }
+}
+
+//+------------------------------------------------------------------+
+//| 将亏损单加入补偿队列                                               |
+//+------------------------------------------------------------------+
+void AddToCompensationQueue(ulong ticket)
+{
+    if(!InpEnableCompensation)
+        return;
+
+    // 需要选择历史记录才能获取已平仓订单的信息
+    if(!HistorySelectByPosition(ticket))
+        return;
+
+    // 查找该持仓的平仓deal
+    int total_deals = HistoryDealsTotal();
+    if(total_deals <= 0)
+        return;
+
+    // 从最新的deal开始找
+    for(int i = total_deals - 1; i >= 0; i--)
+    {
+        ulong deal_ticket = HistoryDealGetTicket(i);
+        if(deal_ticket == 0)
+            continue;
+
+        // 检查是否是该持仓的平仓交易
+        long deal_position = HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
+        if(deal_position != (long)ticket)
+            continue;
+
+        // 检查是否是平仓
+        ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+        if(entry != DEAL_ENTRY_OUT)
+            continue;
+
+        // 获取盈亏信息
+        double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+        double commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+        double swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+        double net_profit = profit + commission + swap;
+
+        // 获取平仓原因
+        ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+
+        // 只处理触发止损的单子
+        if(reason != DEAL_REASON_SL)
+            return;
+
+        // 获取订单信息
+        double lots = HistoryDealGetDouble(deal_ticket, DEAL_VOLUME);
+        long deal_type = HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
+        int direction = (deal_type == DEAL_TYPE_BUY) ? 1 : -1;
+
+        // 从历史记录中查找开仓和平仓价格，计算实际止损金额
+        double open_price = 0;
+        double close_price = 0;
+
+        // 查找该持仓的所有deal
+        int total_deals_temp = HistoryDealsTotal();
+        for(int k = 0; k < total_deals_temp; k++)
+        {
+            ulong temp_ticket = HistoryDealGetTicket(k);
+            if(HistoryDealGetInteger(temp_ticket, DEAL_POSITION_ID) == (long)ticket)
+            {
+                ENUM_DEAL_ENTRY temp_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(temp_ticket, DEAL_ENTRY);
+                if(temp_entry == DEAL_ENTRY_IN)
+                {
+                    open_price = HistoryDealGetDouble(temp_ticket, DEAL_PRICE);
+                }
+                else if(temp_entry == DEAL_ENTRY_OUT)
+                {
+                    close_price = HistoryDealGetDouble(temp_ticket, DEAL_PRICE);
+                }
+            }
+        }
+
+        // 计算实际止损金额 = |平仓价 - 开仓价|（亏损单的止损距离）
+        double stop_loss_amount = MathAbs(close_price - open_price);
+
+        // 加入补偿队列
+        int size = ArraySize(g_compensationQueue);
+        ArrayResize(g_compensationQueue, size + 1);
+
+        g_compensationQueue[size].ticket = (int)ticket;
+        g_compensationQueue[size].loss = MathAbs(net_profit);
+        g_compensationQueue[size].lots = lots;
+        g_compensationQueue[size].stopLossAmount = stop_loss_amount;
+        g_compensationQueue[size].direction = direction;
+        g_compensationQueue[size].closeTime = TimeCurrent();
+
+        Print("【补偿机制】亏损单加入队列 - Ticket:", ticket,
+              " 亏损:$", DoubleToString(MathAbs(net_profit), 2),
+              " 手数:", lots,
+              " 止损金额:$", DoubleToString(stop_loss_amount, 2),
+              " (", (int)(stop_loss_amount / _Point), "点)",
+              " 方向:", (direction == 1 ? "多单" : "空单"),
+              " 开仓:", open_price, " 平仓:", close_price,
+              " 队列大小:", ArraySize(g_compensationQueue));
+
+        break;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 开立补偿单                                                         |
+//+------------------------------------------------------------------+
+bool OpenCompensationOrder()
+{
+    if(!InpEnableCompensation)
+        return false;
+
+    // 检查补偿队列长度是否达到最小要求
+    int queue_size = ArraySize(g_compensationQueue);
+    if(queue_size < InpMinCompensationQueueSize)
+    {
+        if(queue_size > 0 && InpShowDebugInfo)
+            Print("【补偿机制】队列长度不足 (", queue_size, "/", InpMinCompensationQueueSize, ") - 暂不开补偿单");
+        return false;
+    }
+
+    // 检查连续补偿次数是否超限
+    if(InpMaxConsecutiveCompensations > 0 && g_consecutiveCompensationCount >= InpMaxConsecutiveCompensations)
+    {
+        Print("【补偿机制】连续补偿次数达到限制 (", g_consecutiveCompensationCount, "/", InpMaxConsecutiveCompensations, ")");
+        Print("【补偿机制】重置补偿队列和计数器，停止补偿");
+
+        // 清空队列和快照
+        ArrayResize(g_compensationQueue, 0);
+        ArrayResize(g_currentCompensationSnapshot, 0);
+
+        // 重置计数器
+        g_consecutiveCompensationCount = 0;
+        g_currentCompensationTicket = -1;
+
+        return false;
+    }
+
+    // 检查是否已有补偿单在持仓（双重检查机制）
+    // 如果有补偿单，则不能开新单（队列累积）
+    if(g_currentCompensationTicket >= 0)
+    {
+        // 检查补偿单是否还在持仓中
+        if(PositionSelectByTicket(g_currentCompensationTicket))
+            return false;  // 还在持仓，不开新单
+        else
+            g_currentCompensationTicket = -1;  // 已平仓，重置
+    }
+
+    // 二次检查：遍历所有持仓，确保没有其他补偿单
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+
+        // 检查是否是补偿单
+        string pos_comment = PositionGetString(POSITION_COMMENT);
+        if(StringFind(pos_comment, "[补偿单]") >= 0)
+        {
+            Print("【补偿机制】检测到已有补偿单在持仓 - Ticket:", PositionGetTicket(i), " 暂不开新单");
+            g_currentCompensationTicket = (int)PositionGetTicket(i);  // 同步ticket
+            return false;  // 已有补偿单，拒绝开新单
+        }
+    }
+
+    // 保存当前队列快照（这些亏损单将由本次补偿单负责）
+    int snapshot_size = ArraySize(g_compensationQueue);
+    ArrayResize(g_currentCompensationSnapshot, snapshot_size);
+    for(int i = 0; i < snapshot_size; i++)
+    {
+        g_currentCompensationSnapshot[i] = g_compensationQueue[i];
+    }
+
+    // 清空待处理队列（快照已保存，新的亏损会加入队列等待下一次补偿）
+    ArrayResize(g_compensationQueue, 0);
+
+    // 计算补偿单参数（基于快照，此时 g_compensationQueue 已清空）
+    double lots = 0;
+    double sl_pips = 0;
+    double tp_price = 0;
+    int direction = 0;
+
+    // 计算补偿单参数（基于快照）
+    double total_loss = 0;
+    double total_lots = 0;
+
+    for(int i = 0; i < snapshot_size; i++)
+    {
+        total_loss += g_currentCompensationSnapshot[i].loss;
+        total_lots += g_currentCompensationSnapshot[i].lots;
+    }
+
+    // 补偿单手数 = min(队列总手数, 最大手数限制)
+    lots = MathMin(total_lots, InpMaxCompensationLots);
+
+    // 补偿单止损点数：使用固定参数
+    sl_pips = InpCompensationStopLossPips;
+
+    // 补偿单方向：最近一个亏损单的反方向
+    direction = -g_currentCompensationSnapshot[snapshot_size - 1].direction;
+
+    Print("【补偿机制】计算补偿单参数 - 快照大小:", snapshot_size,
+          " 总手数:", total_lots,
+          " 补偿手数:", lots, (lots < total_lots ? " (受限于最大手数)" : ""),
+          " 总亏损:$", DoubleToString(total_loss, 2));
+
+    if(lots <= 0 || direction == 0)
+        return false;
+
+    Print("【补偿机制】队列快照已保存 - 快照大小:", snapshot_size, " 待处理队列已清空");
+
+    // 开仓
+    ENUM_ORDER_TYPE order_type = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    string comment = StringFormat("[补偿单] Q%d", snapshot_size);
+
+    bool result = false;
+    if(order_type == ORDER_TYPE_BUY) {
+        result = trade.Buy(lots, _Symbol, 0, 0, 0, comment);
+    } else {
+        result = trade.Sell(lots, _Symbol, 0, 0, 0, comment);
+    }
+
+    if(!result) {
+        Print("【补偿机制】开补偿单失败: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+        return false;
+    }
+
+    // 等待持仓更新
+    Sleep(100);
+
+    // 查找刚开的补偿单
+    ulong ticket = 0;
+    double open_price = 0;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+
+        // 查找备注包含"[补偿单]"的持仓
+        string pos_comment = PositionGetString(POSITION_COMMENT);
+        if(StringFind(pos_comment, "[补偿单]") >= 0 &&
+           PositionGetDouble(POSITION_SL) == 0 &&
+           PositionGetDouble(POSITION_TP) == 0) {
+            ticket = PositionGetTicket(i);
+            open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            break;
+        }
+    }
+
+    if(ticket == 0) {
+        Print("【补偿机制】找不到刚开的补偿单");
+        return false;
+    }
+
+    // 计算止损止盈价格（基于实际成交价和固定参数）
+    // 止损金额 = 固定止损点数 × 点值
+    double sl_amount = InpCompensationStopLossPips * _Point;
+
+    // 计算止盈点数：需要盈利 = 快照队列总亏损
+    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double point_value = tick_value / tick_size * _Point;
+    double tp_pips_needed = total_loss / (lots * point_value);
+
+    // 限制止盈点数不超过最大值
+    bool is_capped = false;
+    if(tp_pips_needed > InpMaxCompensationTakeProfitPips) {
+        is_capped = true;
+        tp_pips_needed = InpMaxCompensationTakeProfitPips;
+    }
+
+    Print("【补偿机制】止盈计算 - 总亏损:$", DoubleToString(total_loss, 2),
+          " 手数:", lots,
+          " Tick价值:$", tick_value,
+          " Tick大小:", tick_size,
+          " Point:", _Point,
+          " 每点价值:$", DoubleToString(point_value, 4),
+          " 需要止盈:", (int)tp_pips_needed, "点",
+          is_capped ? " (受限于最大止盈)" : "");
+
+    double sl = 0;
+    double tp = 0;
+
+    if(order_type == ORDER_TYPE_BUY) {
+        sl = NormalizeDouble(open_price - sl_amount, _Digits);
+        tp = NormalizeDouble(open_price + tp_pips_needed * _Point, _Digits);
+    } else {
+        sl = NormalizeDouble(open_price + sl_amount, _Digits);
+        tp = NormalizeDouble(open_price - tp_pips_needed * _Point, _Digits);
+    }
+
+    // 获取平台最小止损距离
+    int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    double min_stop_distance = stops_level * _Point;
+    double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    // 检查并调整止损距离
+    if(order_type == ORDER_TYPE_BUY) {
+        if(stops_level > 0 && (current_bid - sl) < min_stop_distance) {
+            sl = NormalizeDouble(current_bid - min_stop_distance, _Digits);
+            Print("【补偿机制】止损距离不足，已调整 - 新止损:", sl);
+        }
+        if(stops_level > 0 && (tp - current_ask) < min_stop_distance) {
+            tp = NormalizeDouble(current_ask + min_stop_distance, _Digits);
+            Print("【补偿机制】止盈距离不足，已调整 - 新止盈:", tp);
+        }
+    } else {
+        if(stops_level > 0 && (sl - current_ask) < min_stop_distance) {
+            sl = NormalizeDouble(current_ask + min_stop_distance, _Digits);
+            Print("【补偿机制】止损距离不足，已调整 - 新止损:", sl);
+        }
+        if(stops_level > 0 && (current_bid - tp) < min_stop_distance) {
+            tp = NormalizeDouble(current_bid - min_stop_distance, _Digits);
+            Print("【补偿机制】止盈距离不足，已调整 - 新止盈:", tp);
+        }
+    }
+
+    // 修改止损止盈
+    if(!trade.PositionModify(ticket, sl, tp)) {
+        Print("【补偿机制】修改SL/TP失败 - Ticket:", ticket,
+              " 错误码:", trade.ResultRetcode(),
+              " 描述:", trade.ResultRetcodeDescription(),
+              " 开仓价:", open_price,
+              " 止损:", sl,
+              " 止盈:", tp,
+              " 平台最小距离:", stops_level, "点");
+        return false;
+    }
+
+    // 记录当前补偿单
+    g_currentCompensationTicket = (int)ticket;
+
+    // 增加连续补偿计数器
+    g_consecutiveCompensationCount++;
+
+    Print("【补偿机制】开补偿单成功 - Ticket:", ticket,
+          " 类型:", (order_type == ORDER_TYPE_BUY ? "多单" : "空单"),
+          " 手数:", lots,
+          " 开仓价:", open_price,
+          " 止损:", sl, " (", InpCompensationStopLossPips, "点)",
+          " 止盈:", tp, " (", (int)tp_pips_needed, "点)",
+          " 需补偿:$", DoubleToString(total_loss, 2),
+          " 连续补偿:", g_consecutiveCompensationCount, "/", InpMaxConsecutiveCompensations);
+
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| 检查补偿单状态                                                     |
+//+------------------------------------------------------------------+
+void CheckCompensationOrderStatus()
+{
+    if(!InpEnableCompensation)
+        return;
+
+    // 如果没有补偿单在追踪，尝试开单
+    if(g_currentCompensationTicket < 0)
+    {
+        // OpenCompensationOrder 内部会检查队列长度是否达到最小要求
+        OpenCompensationOrder();
+        return;
+    }
+
+    // 检查补偿单是否还在持仓
+    if(PositionSelectByTicket(g_currentCompensationTicket))
+        return;  // 还在持仓
+
+    // 补偿单已平仓，检查盈亏
+    if(!HistorySelectByPosition(g_currentCompensationTicket))
+    {
+        g_currentCompensationTicket = -1;
+        return;
+    }
+
+    // 查找平仓deal
+    int total_deals = HistoryDealsTotal();
+    for(int i = total_deals - 1; i >= 0; i--)
+    {
+        ulong deal_ticket = HistoryDealGetTicket(i);
+        if(deal_ticket == 0)
+            continue;
+
+        long deal_position = HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
+        if(deal_position != g_currentCompensationTicket)
+            continue;
+
+        ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+        if(entry != DEAL_ENTRY_OUT)
+            continue;
+
+        // 获取盈亏
+        double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+        double commission = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+        double swap = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+        double net_profit = profit + commission + swap;
+
+        // 获取平仓原因
+        ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+
+        if(reason == DEAL_REASON_TP)
+        {
+            // 补偿单止盈：快照队列成功补偿，清空快照，重置计数器
+            Print("【补偿机制】补偿单止盈 - 盈利:$", DoubleToString(net_profit, 2),
+                  " 快照队列已补偿完成 (", ArraySize(g_currentCompensationSnapshot), "单)",
+                  " 待处理队列:", ArraySize(g_compensationQueue), "单");
+            ArrayResize(g_currentCompensationSnapshot, 0);
+
+            // 止盈成功，重置连续补偿计数器
+            Print("【补偿机制】补偿成功，重置连续补偿计数器: ", g_consecutiveCompensationCount, " → 0");
+            g_consecutiveCompensationCount = 0;
+        }
+        else if(reason == DEAL_REASON_SL)
+        {
+            // 补偿单止损：快照队列需要重新补偿 + 补偿单本身也亏损了
+            Print("【补偿机制】补偿单止损 - 亏损:$", DoubleToString(MathAbs(net_profit), 2),
+                  " 快照队列 (", ArraySize(g_currentCompensationSnapshot), "单) 将重新加入待处理队列");
+
+            // 1. 先把快照队列重新加入待处理队列
+            int current_queue_size = ArraySize(g_compensationQueue);
+            int snapshot_size = ArraySize(g_currentCompensationSnapshot);
+            ArrayResize(g_compensationQueue, current_queue_size + snapshot_size);
+
+            for(int j = 0; j < snapshot_size; j++)
+            {
+                g_compensationQueue[current_queue_size + j] = g_currentCompensationSnapshot[j];
+            }
+
+            // 2. 补偿单本身的亏损也加入队列
+            AddToCompensationQueue(g_currentCompensationTicket);
+
+            // 3. 清空快照
+            ArrayResize(g_currentCompensationSnapshot, 0);
+
+            Print("【补偿机制】待处理队列更新 - 当前大小:", ArraySize(g_compensationQueue), "单");
+        }
+
+        g_currentCompensationTicket = -1;
+        break;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 清空补偿队列                                                       |
+//+------------------------------------------------------------------+
+void ClearCompensationQueue()
+{
+    ArrayResize(g_compensationQueue, 0);
+    Print("【补偿机制】补偿队列已清空");
 }
