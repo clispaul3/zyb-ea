@@ -3,7 +3,7 @@
 //|                                      突破策略 - 单笔突破开仓        |
 //+------------------------------------------------------------------+
 #property copyright "Breakout Strategy"
-#property version   "3.07"
+#property version   "3.14"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -28,20 +28,21 @@ input group "=== 波段识别参数 ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1; // K线周期
 input int      InpMAPeriod = 14;                // MA周期
 input double   InpMinWavePercent = 0.1;         // 最小波段阈值百分比(%)
-input double   InpMaxWavePercent = 1.0;         // 最大波段阈值百分比(%)
+input double   InpMaxWavePercent = 0.25;        // 最大波段阈值百分比(%)
 input double   InpPullbackTolerance = 0.05;     // 反向突破容忍度(%) 0=不容忍
 
 input group "=== 突破交易参数 ==="
-input ENUM_BREAKOUT_DIRECTION InpBreakoutDirection = BREAKOUT_DIR_FOLLOW; // 开仓方向
-input double   InpTakeProfitBalancePct = 1.0;   // 止盈:持仓浮盈达结余比例(%)全部清仓,0=关
+input ENUM_BREAKOUT_DIRECTION InpBreakoutDirection = BREAKOUT_DIR_RANDOM; // 开仓方向
+input int      InpBatchTakeProfitPoints = 300;  // 按批统盈点数(0=关):均价±点数平该批
 input double   InpStopLossBalancePct = 30.0;    // 止损:持仓浮亏达结余比例(%)全部清仓,0=关
+input bool     InpEnablePullbackReverse = true; // 启用突破回落反向
+input int      InpPullbackReverseWatchBars = 3; // 回落监测K线数(突破K+后2根=3)
 
 input group "=== 仓位管理参数 ==="
-input double   InpFixedLots = 0.5;            // 基准手数(同向首笔/每组首笔)
-input double   InpMartingaleAddLotBoost = 2.0;  // 同向加码:每组+手数(0=始终基准)
-input int      InpMartingaleTierInterval = 5;   // 同向加码:档间隔N(每N笔为一组)
-input double   InpMaxLots = 30.0;             // 同向最大合计手数
-input double   InpMinSameDirAddSpacingPercent = 0.1; // 同向最小开仓间距(%) 0=不限制
+input string   InpTierLotsList =
+   "0.05,0.05,0.05,0.8,0.8,1.1,1,2,2,1,1,1,2,2,1,1,1,5,5"; // 各档手数(逗号分隔,档数=最多开仓笔数)
+input double   InpMaxLots = 99.0;             // 同向最大合计手数(0=不限制)
+input double   InpMinSameDirAddSpacingPercent = 0.0; // 同向最小开仓间距(%) 0=不限制
 input ENUM_DUAL_FULL_ACTION InpDualFullAction = DUAL_FULL_CLEAR_ALL; // 双向满档后处理
 
 input group "=== 调试选项 ==="
@@ -64,6 +65,14 @@ struct ValidWaveInfo {
     datetime update_time;                       // 更新时间
     bool high_breakout_used;                    // 高点-突破开仓已用(每极值限1次)
     bool low_breakout_used;                     // 低点-突破开仓已用(每极值限1次)
+    bool high_pullback_reverse_used;            // 高点-回落反向已用(每极值限1次)
+    bool low_pullback_reverse_used;             // 低点-回落反向已用(每极值限1次)
+};
+
+struct PullbackWatchState {
+    bool active;
+    double extreme_price;
+    int bars_checked;
 };
 
 ValidWaveInfo latest_wave;                      // 最新有效波段
@@ -75,6 +84,16 @@ bool g_breakout_opened_on_bar_low = false;
 
 int g_trade_round = 1;                          // 当前交易轮次(新轮仅统计该轮持仓)
 bool g_dual_full_handled = false;               // 本轮双向满档是否已处理
+
+double g_tier_lots[];
+int g_tier_lots_count = 0;
+
+PullbackWatchState g_high_pullback_watch;
+PullbackWatchState g_low_pullback_watch;
+datetime g_pullback_bar_time_high = 0;
+bool g_pullback_opened_on_bar_high = false;
+datetime g_pullback_bar_time_low = 0;
+bool g_pullback_opened_on_bar_low = false;
 
 // 极值点结构体定义
 struct ExtremePoint {
@@ -102,17 +121,34 @@ bool IsDirectionFullActive(const long pos_type);
 void ResetBreakoutWaveEntryFlags();
 void CheckDualSideFullCapacity();
 double NormalizeVolume(double lots);
-double LotForSameDirectionTier(const int tier_index, const double base_lot);
+bool InitTierLotsFromInput();
+int GetMaxTierSlots();
+double LotForTierIndex(const int tier_index);
 double CalculateLotSize(const long pos_type);
+bool IsSameDirectionTierSlotsFull(const long pos_type);
 long PosTypeOnHighBreakout();
 long PosTypeOnLowBreakout();
 void CheckBreakoutSignals();
+void CheckPullbackReverseSignals();
+void TryArmPullbackWatch();
+void ProcessPullbackReverseOnNewBar();
+ENUM_ORDER_TYPE OrderTypeOnHighPullbackReverse();
+ENUM_ORDER_TYPE OrderTypeOnLowPullbackReverse();
+string FormatPullbackReverseComment(const int round);
+bool IsPullbackBarOpenAllowed(const bool for_high_extreme);
+void MarkPullbackBarOpened(const bool for_high_extreme);
+bool OpenPullbackReversePosition(ENUM_ORDER_TYPE order_type, const bool from_high_extreme,
+                                 const double extreme_price);
 ENUM_ORDER_TYPE OrderTypeOnHighBreakout();
 ENUM_ORDER_TYPE OrderTypeOnLowBreakout();
 void CheckAndCloseManualOrders();
 double TotalBreakoutFloatingPL();
 bool CloseAllBreakoutPositions(const string reason);
-void CheckBreakoutBalanceExit();
+void CollectAllTradeRounds(int &rounds[], int &n_rounds);
+bool BatchRoundAvgPrice(const int round_id, const long pos_type, double &avg, double &sum_lots);
+bool CloseBreakoutRoundBatch(const int round_id, const long pos_type, const string reason);
+void CheckBreakoutBatchTakeProfit();
+void CheckBreakoutBalanceStopLoss();
 bool OpenBreakoutPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low,
                           const bool from_high_extreme);
 void SyncBreakoutBarLock(const bool for_high_extreme);
@@ -145,11 +181,20 @@ int OnInit()
     latest_wave.update_time = 0;
     latest_wave.high_breakout_used = false;
     latest_wave.low_breakout_used = false;
+    latest_wave.high_pullback_reverse_used = false;
+    latest_wave.low_pullback_reverse_used = false;
+    g_high_pullback_watch.active = false;
+    g_low_pullback_watch.active = false;
 
     MathSrand((int)(TimeLocal() ^ GetTickCount()));
 
     g_trade_round = 1;
     g_dual_full_handled = false;
+
+    if(!InitTierLotsFromInput()) {
+        Print("解析各档手数失败,请检查 InpTierLotsList");
+        return(INIT_FAILED);
+    }
 
     Print("========================================");
     Print("突破EA初始化成功 (极值点突破开仓)");
@@ -168,10 +213,19 @@ int OnInit()
     else
         Print("开仓方向: 随机(每次突破独立随机)");
     Print("开仓限制: 每个极值点(破高/破低)各最多1笔,可多笔并存");
-    Print("止盈(结余%):", InpTakeProfitBalancePct, " (0=关闭,达标全部清仓)");
+    Print("按批统盈点数:", InpBatchTakeProfitPoints, " (0=关闭,均价±点数平该轮该向)");
     Print("止损(结余%):", InpStopLossBalancePct, " (0=关闭,达标全部清仓)");
-    Print("同向手数: 基准=", InpFixedLots, " 档间隔=", InpMartingaleTierInterval,
-          " 每组+", InpMartingaleAddLotBoost, " 同向上限=", InpMaxLots);
+    if(InpEnablePullbackReverse)
+        Print("回落反向: 开 破极值后监测", InpPullbackReverseWatchBars,
+              "根K收盘回到极值内开反向单(与突破开仓独立)");
+    else
+        Print("回落反向: 关");
+    Print("同向各档手数: 共", g_tier_lots_count, "档(第1档=", g_tier_lots[0],
+          " 末档=", g_tier_lots[g_tier_lots_count - 1], ")");
+    if(InpMaxLots > 0.0)
+        Print("同向合计手数上限:", InpMaxLots);
+    else
+        Print("同向合计手数上限: 不限制");
     if(InpMinSameDirAddSpacingPercent > 0.0)
         Print("同向最小间距%:", InpMinSameDirAddSpacingPercent,
               " (多:现价须≤上一笔×(1-%); 空:现价须≥上一笔×(1+%))");
@@ -213,13 +267,17 @@ void OnTick()
     // 2. 更新最新有效波段
     UpdateLatestValidWave();
 
-    // 3. 结余比例止盈/止损(全部持仓,含历史轮)
-    CheckBreakoutBalanceExit();
+    // 3. 按批统盈(均价+点数) / 结余比例止损(全部持仓)
+    CheckBreakoutBatchTakeProfit();
+    CheckBreakoutBalanceStopLoss();
 
     // 4. 当前轮双向同向均满档 → 清仓或开新轮
     CheckDualSideFullCapacity();
 
-    // 5. 突破信号(破极值开仓,每极值点各限1笔)
+    // 5. 突破回落反向(破极值后K线收盘回到极值内)
+    CheckPullbackReverseSignals();
+
+    // 6. 突破信号(破极值开仓,每极值点各限1笔,与回落反向独立)
     CheckBreakoutSignals();
 }
 
@@ -479,10 +537,16 @@ void UpdateLatestValidWave()
                 latest_wave.update_time = extremes[i].time;
 
                 // 极值价格更新 → 该侧可再开1笔(与是否已有其它持仓无关)
-                if(high != prev_high)
+                if(high != prev_high) {
                     latest_wave.high_breakout_used = false;
-                if(low != prev_low)
+                    latest_wave.high_pullback_reverse_used = false;
+                    g_high_pullback_watch.active = false;
+                }
+                if(low != prev_low) {
                     latest_wave.low_breakout_used = false;
+                    latest_wave.low_pullback_reverse_used = false;
+                    g_low_pullback_watch.active = false;
+                }
 
                 // 绘制最新有效波段
                 if(InpShowMarkers) {
@@ -625,22 +689,22 @@ ENUM_ORDER_TYPE RandomBreakoutOrderType()
 
 int ParseRoundFromComment(const string &comment)
 {
-    const string prefix = "[突破-R";
-    const int i = StringFind(comment, prefix);
-    if(i == 0) {
-        const int start = i + StringLen(prefix);
-        const int end_br = StringFind(comment, "]", start);
-        if(end_br > start)
-            return (int)StringToInteger(StringSubstr(comment, start, end_br - start));
-    }
-    if(StringFind(comment, "[突破]") == 0)
+    if(StringFind(comment, "[突破") != 0)
+        return 0;
+    const int i_r = StringFind(comment, "-R");
+    if(i_r < 0)
         return 1;
-    return 0;
+    const int start = i_r + 2;
+    const int end_br = StringFind(comment, "]", start);
+    if(end_br <= start)
+        return 1;
+    const int r = (int)StringToInteger(StringSubstr(comment, start, end_br - start));
+    return (r >= 1) ? r : 1;
 }
 
 bool IsEaBreakoutComment(const string &comment)
 {
-    return (ParseRoundFromComment(comment) > 0);
+    return (StringFind(comment, "[突破") == 0);
 }
 
 string FormatBreakoutComment(const int round)
@@ -650,10 +714,202 @@ string FormatBreakoutComment(const int round)
     return StringFormat("[突破-R%d]", round);
 }
 
+string FormatPullbackReverseComment(const int round)
+{
+    if(round <= 1)
+        return "[突破-回落]";
+    return StringFormat("[突破-回落-R%d]", round);
+}
+
+ENUM_ORDER_TYPE OrderTypeOnHighPullbackReverse()
+{
+    return ORDER_TYPE_SELL;
+}
+
+ENUM_ORDER_TYPE OrderTypeOnLowPullbackReverse()
+{
+    return ORDER_TYPE_BUY;
+}
+
+void SyncPullbackBarLock(const bool for_high_extreme)
+{
+    const datetime bar_time = iTime(_Symbol, InpTimeframe, 0);
+    if(bar_time == 0)
+        return;
+    if(for_high_extreme) {
+        if(bar_time != g_pullback_bar_time_high) {
+            g_pullback_bar_time_high = bar_time;
+            g_pullback_opened_on_bar_high = false;
+        }
+    } else {
+        if(bar_time != g_pullback_bar_time_low) {
+            g_pullback_bar_time_low = bar_time;
+            g_pullback_opened_on_bar_low = false;
+        }
+    }
+}
+
+bool IsPullbackBarOpenAllowed(const bool for_high_extreme)
+{
+    SyncPullbackBarLock(for_high_extreme);
+    if(for_high_extreme)
+        return !g_pullback_opened_on_bar_high;
+    return !g_pullback_opened_on_bar_low;
+}
+
+void MarkPullbackBarOpened(const bool for_high_extreme)
+{
+    SyncPullbackBarLock(for_high_extreme);
+    if(for_high_extreme)
+        g_pullback_opened_on_bar_high = true;
+    else
+        g_pullback_opened_on_bar_low = true;
+}
+
+bool OpenPullbackReversePosition(ENUM_ORDER_TYPE order_type, const bool from_high_extreme,
+                                 const double extreme_price)
+{
+    if(!IsPullbackBarOpenAllowed(from_high_extreme))
+        return false;
+
+    const long pos_type = (order_type == ORDER_TYPE_BUY) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+    const double lots = CalculateLotSize(pos_type);
+    if(lots <= 0.0)
+        return false;
+
+    if(InpMaxLots > 0.0) {
+        const double cur_lots = TotalLotsInDirection(pos_type);
+        if(cur_lots + lots > InpMaxLots + 1e-8) {
+            if(InpShowDebugInfo)
+                Print("【回落反向】开仓跳过 - 同向合计将超上限 ", InpMaxLots);
+            return false;
+        }
+    }
+
+    if(!IsSameDirMinSpacingSatisfied(pos_type)) {
+        if(InpShowDebugInfo)
+            Print("【回落反向】开仓跳过 - 未达同向最小间距%");
+        return false;
+    }
+
+    const string comment = FormatPullbackReverseComment(g_trade_round);
+    bool result = false;
+    if(order_type == ORDER_TYPE_BUY)
+        result = trade.Buy(lots, _Symbol, 0, 0, 0, comment);
+    else
+        result = trade.Sell(lots, _Symbol, 0, 0, 0, comment);
+
+    if(!result) {
+        Print("【回落反向】开仓失败: ", trade.ResultRetcode(), " - ",
+              trade.ResultRetcodeDescription());
+        return false;
+    }
+
+    MarkPullbackBarOpened(from_high_extreme);
+    Print("【回落反向】开仓成功 ", (order_type == ORDER_TYPE_BUY ? "多" : "空"),
+          " 手数:", lots, " 极值:", extreme_price, " 备注:", comment);
+    return true;
+}
+
+void TryArmPullbackWatch()
+{
+    if(!InpEnablePullbackReverse || !latest_wave.exists)
+        return;
+
+    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    if(ask > latest_wave.high_price && !latest_wave.high_pullback_reverse_used) {
+        if(!g_high_pullback_watch.active ||
+           g_high_pullback_watch.extreme_price != latest_wave.high_price) {
+            g_high_pullback_watch.active = true;
+            g_high_pullback_watch.extreme_price = latest_wave.high_price;
+            g_high_pullback_watch.bars_checked = 0;
+            if(InpShowDebugInfo)
+                Print("【回落反向】开始监测破高 极值:", latest_wave.high_price,
+                      " 共", InpPullbackReverseWatchBars, "根K");
+        }
+    }
+
+    if(bid < latest_wave.low_price && !latest_wave.low_pullback_reverse_used) {
+        if(!g_low_pullback_watch.active ||
+           g_low_pullback_watch.extreme_price != latest_wave.low_price) {
+            g_low_pullback_watch.active = true;
+            g_low_pullback_watch.extreme_price = latest_wave.low_price;
+            g_low_pullback_watch.bars_checked = 0;
+            if(InpShowDebugInfo)
+                Print("【回落反向】开始监测破低 极值:", latest_wave.low_price,
+                      " 共", InpPullbackReverseWatchBars, "根K");
+        }
+    }
+}
+
+void ProcessPullbackReverseOnNewBar()
+{
+    if(!InpEnablePullbackReverse || !latest_wave.exists)
+        return;
+
+    const int max_bars = MathMax(1, InpPullbackReverseWatchBars);
+
+    if(g_high_pullback_watch.active && !latest_wave.high_pullback_reverse_used) {
+        const double close1 = iClose(_Symbol, InpTimeframe, 1);
+        if(close1 > 0.0 && close1 <= g_high_pullback_watch.extreme_price) {
+            if(OpenPullbackReversePosition(OrderTypeOnHighPullbackReverse(), true,
+                                           g_high_pullback_watch.extreme_price))
+                latest_wave.high_pullback_reverse_used = true;
+            g_high_pullback_watch.active = false;
+        } else {
+            g_high_pullback_watch.bars_checked++;
+            if(g_high_pullback_watch.bars_checked >= max_bars) {
+                if(InpShowDebugInfo)
+                    Print("【回落反向】破高监测结束 未回落极值内");
+                g_high_pullback_watch.active = false;
+            }
+        }
+    }
+
+    if(g_low_pullback_watch.active && !latest_wave.low_pullback_reverse_used) {
+        const double close1 = iClose(_Symbol, InpTimeframe, 1);
+        if(close1 > 0.0 && close1 >= g_low_pullback_watch.extreme_price) {
+            if(OpenPullbackReversePosition(OrderTypeOnLowPullbackReverse(), false,
+                                           g_low_pullback_watch.extreme_price))
+                latest_wave.low_pullback_reverse_used = true;
+            g_low_pullback_watch.active = false;
+        } else {
+            g_low_pullback_watch.bars_checked++;
+            if(g_low_pullback_watch.bars_checked >= max_bars) {
+                if(InpShowDebugInfo)
+                    Print("【回落反向】破低监测结束 未回升极值内");
+                g_low_pullback_watch.active = false;
+            }
+        }
+    }
+}
+
+void CheckPullbackReverseSignals()
+{
+    if(!InpEnablePullbackReverse)
+        return;
+
+    TryArmPullbackWatch();
+
+    static datetime s_last_bar_time = 0;
+    const datetime bar_time = iTime(_Symbol, InpTimeframe, 0);
+    if(bar_time == 0 || bar_time == s_last_bar_time)
+        return;
+    s_last_bar_time = bar_time;
+
+    ProcessPullbackReverseOnNewBar();
+}
+
 void ResetBreakoutWaveEntryFlags()
 {
     latest_wave.high_breakout_used = false;
     latest_wave.low_breakout_used = false;
+    latest_wave.high_pullback_reverse_used = false;
+    latest_wave.low_pullback_reverse_used = false;
+    g_high_pullback_watch.active = false;
+    g_low_pullback_watch.active = false;
 }
 
 int CountAllBreakoutPositions()
@@ -715,16 +971,27 @@ double TotalLotsInDirection(const long pos_type)
     return sum;
 }
 
+bool IsSameDirectionTierSlotsFull(const long pos_type)
+{
+    const int tier = CountBreakoutPositions(pos_type);
+    if(tier >= g_tier_lots_count)
+        return true;
+    const double next_lot = LotForTierIndex(tier);
+    if(next_lot <= 0.0)
+        return true;
+    if(InpMaxLots > 0.0) {
+        const double cur = TotalLotsInDirection(pos_type);
+        if(cur >= InpMaxLots - 1e-8)
+            return true;
+        if(cur + next_lot > InpMaxLots + 1e-8)
+            return true;
+    }
+    return false;
+}
+
 bool IsDirectionFullActive(const long pos_type)
 {
-    const double cur = TotalLotsInDirection(pos_type);
-    if(cur >= InpMaxLots - 1e-8)
-        return true;
-    // 按下一笔实际加码手数判断(非仅基准手): 如19.5手+下一笔4.5>20亦视为满档
-    const double next_lot = CalculateLotSize(pos_type);
-    if(next_lot <= 0.0)
-        return (cur > 0.0);
-    return (cur + next_lot > InpMaxLots + 1e-8);
+    return IsSameDirectionTierSlotsFull(pos_type);
 }
 
 void CheckDualSideFullCapacity()
@@ -842,26 +1109,53 @@ double NormalizeVolume(double lots)
     return lots;
 }
 
-// tier_index: 0=该方向首笔, 1=第2笔…；grp=tier/N，组内手数相同，每组=基准+grp×加码
-double LotForSameDirectionTier(const int tier_index, const double base_lot)
+bool InitTierLotsFromInput()
 {
-    if(tier_index < 0 || base_lot <= 0.0)
+    ArrayResize(g_tier_lots, 0);
+    g_tier_lots_count = 0;
+
+    string parts[];
+    const int n = StringSplit(InpTierLotsList, ',', parts);
+    if(n <= 0)
+        return false;
+
+    for(int i = 0; i < n; i++) {
+        string token = parts[i];
+        StringTrimLeft(token);
+        StringTrimRight(token);
+        if(StringLen(token) == 0)
+            continue;
+        const double v = StringToDouble(token);
+        if(v <= 0.0)
+            continue;
+        ArrayResize(g_tier_lots, g_tier_lots_count + 1);
+        g_tier_lots[g_tier_lots_count++] = v;
+    }
+    return (g_tier_lots_count > 0);
+}
+
+int GetMaxTierSlots()
+{
+    return g_tier_lots_count;
+}
+
+double LotForTierIndex(const int tier_index)
+{
+    if(tier_index < 0 || tier_index >= g_tier_lots_count)
         return 0.0;
-    const int n = MathMax(1, InpMartingaleTierInterval);
-    const int grp = tier_index / n;
-    if(InpMartingaleAddLotBoost <= 0.0)
-        return NormalizeVolume(base_lot);
-    double vol = base_lot + (double)grp * InpMartingaleAddLotBoost;
-    return NormalizeVolume(MathMin(vol, InpMaxLots));
+    double vol = g_tier_lots[tier_index];
+    if(InpMaxLots > 0.0)
+        vol = MathMin(vol, InpMaxLots);
+    return NormalizeVolume(vol);
 }
 
 //+------------------------------------------------------------------+
-//| 按同向持仓笔数(档)计算本笔手数                                       |
+//| 按同向已有笔数取下一档手数(tier=0为第1笔)                             |
 //+------------------------------------------------------------------+
 double CalculateLotSize(const long pos_type)
 {
     const int tier = CountBreakoutPositions(pos_type);
-    return LotForSameDirectionTier(tier, InpFixedLots);
+    return LotForTierIndex(tier);
 }
 
 bool GetLastSameDirectionOpenPrice(const long pos_type, double &last_open)
@@ -964,8 +1258,146 @@ bool CloseAllBreakoutPositions(const string reason)
     return ok && n > 0;
 }
 
-void CheckBreakoutBalanceExit()
+void CollectAllTradeRounds(int &rounds[], int &n_rounds)
 {
+    n_rounds = 0;
+    ArrayResize(rounds, 0);
+    const int total = PositionsTotal();
+    for(int i = 0; i < total; i++) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+        const int r = ParseRoundFromComment(PositionGetString(POSITION_COMMENT));
+        if(r < 1)
+            continue;
+        bool found = false;
+        for(int j = 0; j < n_rounds; j++) {
+            if(rounds[j] == r) {
+                found = true;
+                break;
+            }
+        }
+        if(!found) {
+            ArrayResize(rounds, n_rounds + 1);
+            rounds[n_rounds++] = r;
+        }
+    }
+}
+
+bool BatchRoundAvgPrice(const int round_id, const long pos_type, double &avg, double &sum_lots)
+{
+    avg = 0.0;
+    sum_lots = 0.0;
+    double sum_px_vol = 0.0;
+    const int total = PositionsTotal();
+    for(int i = 0; i < total; i++) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+        if(PositionGetInteger(POSITION_TYPE) != pos_type)
+            continue;
+        if(ParseRoundFromComment(PositionGetString(POSITION_COMMENT)) != round_id)
+            continue;
+        const double v = PositionGetDouble(POSITION_VOLUME);
+        const double p = PositionGetDouble(POSITION_PRICE_OPEN);
+        sum_px_vol += p * v;
+        sum_lots += v;
+    }
+    if(sum_lots <= 1e-12)
+        return false;
+    avg = sum_px_vol / sum_lots;
+    return true;
+}
+
+bool CloseBreakoutRoundBatch(const int round_id, const long pos_type, const string reason)
+{
+    ulong tickets[];
+    int n = 0;
+    const int total = PositionsTotal();
+    for(int i = 0; i < total; i++) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+        if(PositionGetInteger(POSITION_TYPE) != pos_type)
+            continue;
+        if(ParseRoundFromComment(PositionGetString(POSITION_COMMENT)) != round_id)
+            continue;
+        ArrayResize(tickets, n + 1);
+        tickets[n++] = PositionGetTicket(i);
+    }
+    if(n <= 0)
+        return false;
+
+    bool ok = true;
+    for(int j = 0; j < n; j++) {
+        if(!trade.PositionClose(tickets[j]))
+            ok = false;
+    }
+    if(ok) {
+        Print("【突破】", (pos_type == POSITION_TYPE_BUY ? "多单" : "空单"),
+              " 第", round_id, "轮批平仓 笔数=", n, " 原因:", reason);
+        if(round_id == g_trade_round && CountBreakoutPositions(pos_type) == 0)
+            g_dual_full_handled = false;
+    }
+    return ok;
+}
+
+void CheckBreakoutBatchTakeProfitForRoundDir(const int round_id, const long pos_type)
+{
+    double avg = 0.0, sum_lots = 0.0;
+    if(!BatchRoundAvgPrice(round_id, pos_type, avg, sum_lots))
+        return;
+
+    const double tp_off = (double)InpBatchTakeProfitPoints * _Point;
+    bool hit = false;
+
+    if(pos_type == POSITION_TYPE_BUY) {
+        const double px = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        hit = (px >= avg + tp_off);
+    } else {
+        const double px = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        hit = (px <= avg - tp_off);
+    }
+
+    if(!hit)
+        return;
+
+    const double target = (pos_type == POSITION_TYPE_BUY) ? (avg + tp_off) : (avg - tp_off);
+    CloseBreakoutRoundBatch(round_id, pos_type,
+        StringFormat("统盈 均价%s+%d点 目标%s",
+                     DoubleToString(avg, _Digits), InpBatchTakeProfitPoints,
+                     DoubleToString(target, _Digits)));
+}
+
+void CheckBreakoutBatchTakeProfit()
+{
+    if(InpBatchTakeProfitPoints <= 0)
+        return;
+
+    int rounds[];
+    int n_rounds = 0;
+    CollectAllTradeRounds(rounds, n_rounds);
+
+    for(int i = 0; i < n_rounds; i++) {
+        CheckBreakoutBatchTakeProfitForRoundDir(rounds[i], POSITION_TYPE_BUY);
+        CheckBreakoutBatchTakeProfitForRoundDir(rounds[i], POSITION_TYPE_SELL);
+    }
+}
+
+void CheckBreakoutBalanceStopLoss()
+{
+    if(InpStopLossBalancePct <= 0.0)
+        return;
+
     if(CountAllBreakoutPositions() == 0)
         return;
 
@@ -974,23 +1406,10 @@ void CheckBreakoutBalanceExit()
         return;
 
     const double fpl = TotalBreakoutFloatingPL();
-
-    if(InpTakeProfitBalancePct > 0.0) {
-        const double tp_need = balance * (InpTakeProfitBalancePct / 100.0);
-        if(fpl >= tp_need) {
-            CloseAllBreakoutPositions(
-                StringFormat("止盈:浮盈%.2f达结余%.2f%%", fpl, InpTakeProfitBalancePct));
-            return;
-        }
-    }
-
-    if(InpStopLossBalancePct > 0.0) {
-        const double sl_need = balance * (InpStopLossBalancePct / 100.0);
-        if(fpl <= -sl_need) {
-            CloseAllBreakoutPositions(
-                StringFormat("止损:浮亏%.2f达结余%.2f%%", fpl, InpStopLossBalancePct));
-        }
-    }
+    const double sl_need = balance * (InpStopLossBalancePct / 100.0);
+    if(fpl <= -sl_need)
+        CloseAllBreakoutPositions(
+            StringFormat("止损:浮亏%.2f达结余%.2f%%", fpl, InpStopLossBalancePct));
 }
 
 void SyncBreakoutBarLock(const bool for_high_extreme)
@@ -1040,11 +1459,17 @@ bool OpenBreakoutPosition(ENUM_ORDER_TYPE order_type, double wave_high, double w
     if(lots <= 0.0)
         return false;
 
-    const double cur_lots = TotalLotsInDirection(pos_type);
-    if(cur_lots + lots > InpMaxLots + 1e-8) {
-        Print("【突破】开仓跳过 - 同向合计将超上限 ", InpMaxLots,
-              " 当前:", cur_lots, " 拟开:", lots);
+    if(lots <= 0.0) {
+        Print("【突破】开仓跳过 - 同向已达最大档数 ", g_tier_lots_count);
         return false;
+    }
+    if(InpMaxLots > 0.0) {
+        const double cur_lots = TotalLotsInDirection(pos_type);
+        if(cur_lots + lots > InpMaxLots + 1e-8) {
+            Print("【突破】开仓跳过 - 同向合计将超上限 ", InpMaxLots,
+                  " 当前:", cur_lots, " 拟开:", lots);
+            return false;
+        }
     }
 
     if(!IsSameDirMinSpacingSatisfied(pos_type)) {
@@ -1072,10 +1497,9 @@ bool OpenBreakoutPosition(ENUM_ORDER_TYPE order_type, double wave_high, double w
     }
 
     MarkBreakoutBarOpened(from_high_extreme);
-    const int tier = CountBreakoutPositions(pos_type) - 1;
-    const int grp = (tier >= 0) ? (tier / MathMax(1, InpMartingaleTierInterval)) : 0;
+    const int tier = CountBreakoutPositions(pos_type);
     Print("【突破】开仓成功 ", (order_type == ORDER_TYPE_BUY ? "多" : "空"),
-          " 手数:", lots, " 轮次:", g_trade_round, " 同向第", (tier + 1), "笔/组", (grp + 1),
+          " 手数:", lots, " 轮次:", g_trade_round, " 同向第", tier, "/", g_tier_lots_count, "档",
           " 备注:", comment, " 波段 H:", wave_high, " L:", wave_low);
     return true;
 }
