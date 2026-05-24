@@ -3,10 +3,16 @@
 //|                                      突破交易策略 - 完整交易版本    |
 //+------------------------------------------------------------------+
 #property copyright "Breakout Strategy"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
 #include <Trade\Trade.mqh>
+
+// 手数计算方式
+enum ENUM_LOT_SIZE_MODE {
+    LOT_SIZE_FIXED = 0,        // 固定手数
+    LOT_SIZE_RISK_PERCENT = 1  // 结余风险比例(RiskPercent)
+};
 
 //+------------------------------------------------------------------+
 //| 输入参数                                                           |
@@ -15,20 +21,21 @@ input group "=== 波段识别参数 ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1; // K线周期
 input int      InpMAPeriod = 14;                // MA周期
 input double   InpMinWavePercent = 0.1;         // 最小波段阈值百分比(%)
-input double   InpMaxWavePercent = 1.0;         // 最大波段阈值百分比(%)
+input double   InpMaxWavePercent = 10.0;        // 最大波段阈值百分比(%)
 input double   InpPullbackTolerance = 0.0;      // 反向突破容忍度(%) 0=不容忍
+input int      InpMinWaveBars = 3;              // 有效波段最少K线数(含两端极值所在K)
 
 input group "=== 风险管理参数 ==="
-input double   InpStopLossPercent = 0.02;       // 止损百分比(%)
-input int      InpMinStopLossPoints = 10;       // 最小止损点数
-input double   InpRiskRewardRatio = 1.2;        // 盈亏比
-input bool     InpUseTrailingStop = false;      // 使用移动止损
+input int      InpStopLossPoints = 200;         // 止损点数
+input int      InpTakeProfitPoints = 300;       // 止盈点数
+input bool     InpUseTrailingStop = true;       // 使用移动止损
 
 input group "=== 仓位管理参数 ==="
-input bool     InpUseCompounding = true;        // 使用复利模式
-input double   InpFixedLots = 0.01;             // 固定手数
-input double   InpLotsPer500 = 0.05;            // 每500$开仓手数(复利模式)
-input int      InpMaxPositions = 99;            // 最大开仓手数
+input ENUM_LOT_SIZE_MODE InpLotSizeMode = LOT_SIZE_RISK_PERCENT; // 手数模式
+input double   InpFixedLots = 0.01;             // 固定手数(固定模式)
+input double   InpRiskPercent = 5.0;            // 每笔风险占结余%(风险比例模式)
+input double   InpMaxLots = 99.0;               // 单笔最大手数(0=仅受品种限制)
+input int      InpMaxPositions = 99;            // 最大持仓笔数
 input bool     InpOnePositionPerDirection = true; // 单方向最多持有一单
 
 input group "=== 连续亏损保护 ==="
@@ -59,6 +66,9 @@ struct ValidWaveInfo {
 
 ValidWaveInfo latest_wave;                      // 最新有效波段
 
+double g_sync_wave_high = 0.0;                  // 已挂单的波段高价(用于检测换波段)
+double g_sync_wave_low = 0.0;
+
 // 连续亏损保护相关变量
 int consecutive_loss_count = 0;                 // 连续亏损计数器
 datetime freeze_until_time = 0;                 // 冷冻结束时间(0表示未冷冻)
@@ -74,14 +84,24 @@ struct ExtremePoint {
 
 // 函数声明
 void UpdateLatestValidWave();
+int CountBarsBetweenExtremeTimes(const MqlRates &rates[], const datetime t1, const datetime t2);
+bool IsValidWaveByBarCount(const MqlRates &rates[], const datetime t1, const datetime t2);
 void DrawExtremeMarkers(ExtremePoint &extremes[]);
 void DrawLatestValidWave(double high_price, datetime high_time, double low_price, datetime low_time);
 int CheckBreakout(int index, const MqlRates &rates[], const double &ma[]);
 void FilterBreakouts(const int &breakout_bars[], const int &breakout_types[],
                     const MqlRates &rates[], int &filtered_bars[], int &filtered_types[]);
-void CheckOpenSignals();
-bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low, double threshold_points);
-double CalculateLotSize();
+void SyncBreakoutPendingOrders();
+void CancelEaPendingOrders(const bool cancel_buy_stop, const bool cancel_sell_stop);
+ulong FindEaPendingOrder(const ENUM_ORDER_TYPE order_type);
+bool CalcPendingSlTp(const ENUM_ORDER_TYPE pending_type, const double trigger_price, double &sl, double &tp);
+bool PlaceBreakoutPendingOrder(const ENUM_ORDER_TYPE pending_type, const double trigger_price,
+                               const double wave_high, const double wave_low);
+double GetStopLossOffset();
+double GetTakeProfitOffset();
+double StopLossAmountFromPositionComment(const string &comment);
+double CalculateLotSize(const double wave_high, const double wave_low);
+double NormalizeVolumeLots(double lots);
 void ManagePositions();
 void CheckTrailingStop(ulong ticket);
 void CheckAndCloseManualOrders();
@@ -117,20 +137,24 @@ int OnInit()
     Print("K线周期:", EnumToString(InpTimeframe));
     Print("MA周期:", InpMAPeriod);
     Print("波段阈值范围: ", InpMinWavePercent, "% - ", InpMaxWavePercent, "%");
+    Print("有效波段最少K线: ", InpMinWaveBars, " (两极值间含两端,<=1=不限制)");
     if(InpPullbackTolerance > 0)
         Print("反向突破容忍度: ", DoubleToString(InpPullbackTolerance, 1), "% (启用)");
     else
         Print("反向突破容忍度: 0% (禁用 - 保持原有逻辑)");
-    Print("止损:", InpStopLossPercent, "% (最小", InpMinStopLossPoints, "点) | 盈亏比:", InpRiskRewardRatio);
+    Print("止损:", InpStopLossPoints, "点 | 止盈:", InpTakeProfitPoints, "点");
     Print("移动止损:", (InpUseTrailingStop ? "启用" : "禁用"));
-    Print("最大开仓手数:", InpMaxPositions);
+    Print("最大持仓笔数:", InpMaxPositions, " 单笔最大手数:", InpMaxLots);
     Print("单方向持仓限制:", (InpOnePositionPerDirection ? "启用 (每方向最多1单)" : "禁用"));
     if(InpConsecutiveLosses > 0 && InpFreezeBarCount > 0)
         Print("连续亏损保护: 启用 (", InpConsecutiveLosses, "次亏损→冷冻", InpFreezeBarCount, "根K线)");
     else
         Print("连续亏损保护: 禁用");
-    Print("手数模式:", (InpUseCompounding ? "复利" : "固定"),
-          InpUseCompounding ? StringFormat(" (每500$开%.2f手)", InpLotsPer500) : StringFormat(" (%.2f手)", InpFixedLots));
+    if(InpLotSizeMode == LOT_SIZE_RISK_PERCENT)
+        Print("手数模式: 结余风险比例 ", InpRiskPercent, "% (按止损距离反推手数)");
+    else
+        Print("手数模式: 固定手数 ", InpFixedLots);
+    Print("开仓方式: 突破挂单 (高点BUY STOP / 低点SELL STOP)");
     Print("禁止手工单:", (InpCloseManualOrders ? "启用 (自动平掉手工单)" : "禁用"));
     Print("========================================");
 
@@ -147,6 +171,7 @@ void OnDeinit(const int reason)
 
     // 删除所有标记
     ObjectsDeleteAll(0, "ValidWave_");
+    CancelEaPendingOrders(true, true);
 
     Print("突破交易策略EA已卸载");
 }
@@ -158,7 +183,22 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
-    // 只在功能启用时处理
+    if(trans.type == TRADE_TRANSACTION_DEAL_ADD) {
+        if(HistoryDealSelect(trans.deal)) {
+            if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) == _Symbol &&
+               HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == InpMagicNumber &&
+               HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_IN) {
+                const ENUM_DEAL_TYPE deal_type =
+                    (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+                if(deal_type == DEAL_TYPE_BUY)
+                    latest_wave.high_used = true;
+                else if(deal_type == DEAL_TYPE_SELL)
+                    latest_wave.low_used = true;
+            }
+        }
+    }
+
+    // 只在功能启用时处理连续亏损
     if(InpConsecutiveLosses <= 0 || InpFreezeBarCount <= 0)
         return;
 
@@ -236,8 +276,8 @@ void OnTick()
     // 2. 更新最新有效波段
     UpdateLatestValidWave();
 
-    // 3. 检查开仓信号
-    CheckOpenSignals();
+    // 3. 同步突破挂单(BUY STOP@高 / SELL STOP@低)
+    SyncBreakoutPendingOrders();
 
     // 4. 管理已有持仓
     ManagePositions();
@@ -246,6 +286,26 @@ void OnTick()
 //+------------------------------------------------------------------+
 //| 更新最新有效波段                                                   |
 //+------------------------------------------------------------------+
+int CountBarsBetweenExtremeTimes(const MqlRates &rates[], const datetime t1, const datetime t2)
+{
+    const datetime t_lo = (t1 <= t2) ? t1 : t2;
+    const datetime t_hi = (t1 >= t2) ? t1 : t2;
+    int count = 0;
+    const int n = ArraySize(rates);
+    for(int j = 0; j < n; j++) {
+        if(rates[j].time >= t_lo && rates[j].time <= t_hi)
+            count++;
+    }
+    return count;
+}
+
+bool IsValidWaveByBarCount(const MqlRates &rates[], const datetime t1, const datetime t2)
+{
+    if(InpMinWaveBars <= 1)
+        return true;
+    return (CountBarsBetweenExtremeTimes(rates, t1, t2) >= InpMinWaveBars);
+}
+
 void UpdateLatestValidWave()
 {
     int bars = Bars(_Symbol, InpTimeframe);
@@ -455,7 +515,8 @@ void UpdateLatestValidWave()
         double max_threshold = (base_price * InpMaxWavePercent / 100.0) / _Point;
 
         // 波段必须在最小和最大阈值之间才是有效波段
-        if(price_diff_points >= min_threshold && price_diff_points <= max_threshold) {
+        if(price_diff_points >= min_threshold && price_diff_points <= max_threshold &&
+           IsValidWaveByBarCount(rates, extremes[i - 1].time, extremes[i].time)) {
             extremes[i-1].is_valid = true;
             extremes[i].is_valid = true;
         }
@@ -477,7 +538,8 @@ void UpdateLatestValidWave()
         double max_threshold = (base_price * InpMaxWavePercent / 100.0) / _Point;
 
         // 波段必须在最小和最大阈值之间才是有效波段
-        if(price_diff_points >= min_threshold && price_diff_points <= max_threshold) {
+        if(price_diff_points >= min_threshold && price_diff_points <= max_threshold &&
+           IsValidWaveByBarCount(rates, extremes[i - 1].time, extremes[i].time)) {
             // 找到最新的有效波段
             double high = MathMax(extremes[i].price, extremes[i-1].price);
             double low = MathMin(extremes[i].price, extremes[i-1].price);
@@ -506,6 +568,7 @@ void UpdateLatestValidWave()
                     Print("更新最新有效波段 - 高:", DoubleToString(high, _Digits),
                           " 低:", DoubleToString(low, _Digits),
                           " 价差:", (int)price_diff_points, "点",
+                          " K线数:", CountBarsBetweenExtremeTimes(rates, extremes[i - 1].time, extremes[i].time),
                           " 阈值范围:", StringFormat("%.2f%%-%.2f%% (%.0f-%.0f点)",
                                 InpMinWavePercent, InpMaxWavePercent, min_threshold, max_threshold));
                 }
@@ -632,39 +695,143 @@ void FilterBreakouts(const int &breakout_bars[], const int &breakout_types[],
 }
 
 //+------------------------------------------------------------------+
-//| 检查开仓信号                                                       |
+//| 突破挂单管理                                                       |
 //+------------------------------------------------------------------+
-void CheckOpenSignals()
+void CancelEaPendingOrders(const bool cancel_buy_stop, const bool cancel_sell_stop)
 {
-    if(!latest_wave.exists)
-        return;
+    for(int i = OrdersTotal() - 1; i >= 0; i--) {
+        const ulong ticket = OrderGetTicket(i);
+        if(ticket == 0 || !OrderSelect(ticket))
+            continue;
+        if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+            continue;
+        if(OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
+            continue;
 
-    // 检查是否处于冷冻期
-    if(InpConsecutiveLosses > 0 && InpFreezeBarCount > 0 && freeze_bar_index > 0)
-    {
-        int current_bars = Bars(_Symbol, InpTimeframe);
-        if(current_bars < freeze_bar_index)
-        {
-            // 仍在冷冻期内 - 静默拒绝开仓
+        const ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+        if(cancel_buy_stop && ot == ORDER_TYPE_BUY_STOP)
+            trade.OrderDelete(ticket);
+        else if(cancel_sell_stop && ot == ORDER_TYPE_SELL_STOP)
+            trade.OrderDelete(ticket);
+    }
+}
+
+ulong FindEaPendingOrder(const ENUM_ORDER_TYPE order_type)
+{
+    for(int i = OrdersTotal() - 1; i >= 0; i--) {
+        const ulong ticket = OrderGetTicket(i);
+        if(ticket == 0 || !OrderSelect(ticket))
+            continue;
+        if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+            continue;
+        if(OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
+            continue;
+        if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) == order_type)
+            return ticket;
+    }
+    return 0;
+}
+
+bool CalcPendingSlTp(const ENUM_ORDER_TYPE pending_type, const double trigger_price, double &sl, double &tp)
+{
+    const double stop_loss_amount = GetStopLossOffset();
+    const double take_profit_amount = GetTakeProfitOffset();
+    const int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    const double min_stop_distance = stops_level * _Point;
+
+    sl = 0.0;
+    tp = 0.0;
+
+    if(pending_type == ORDER_TYPE_BUY_STOP) {
+        sl = NormalizeDouble(trigger_price - stop_loss_amount, _Digits);
+        tp = NormalizeDouble(trigger_price + take_profit_amount, _Digits);
+        if(stops_level > 0) {
+            if(trigger_price - sl < min_stop_distance)
+                sl = NormalizeDouble(trigger_price - min_stop_distance, _Digits);
+            if(tp - trigger_price < min_stop_distance)
+                tp = NormalizeDouble(trigger_price + min_stop_distance, _Digits);
+        }
+    } else if(pending_type == ORDER_TYPE_SELL_STOP) {
+        sl = NormalizeDouble(trigger_price + stop_loss_amount, _Digits);
+        tp = NormalizeDouble(trigger_price - take_profit_amount, _Digits);
+        if(stops_level > 0) {
+            if(sl - trigger_price < min_stop_distance)
+                sl = NormalizeDouble(trigger_price + min_stop_distance, _Digits);
+            if(trigger_price - tp < min_stop_distance)
+                tp = NormalizeDouble(trigger_price - min_stop_distance, _Digits);
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool PlaceBreakoutPendingOrder(const ENUM_ORDER_TYPE pending_type, const double trigger_price,
+                               const double wave_high, const double wave_low)
+{
+    const double lots = CalculateLotSize(wave_high, wave_low);
+    if(lots <= 0.0)
+        return false;
+
+    double sl = 0.0, tp = 0.0;
+    if(!CalcPendingSlTp(pending_type, trigger_price, sl, tp))
+        return false;
+
+    const int wave_range_points = (int)MathRound(MathAbs(wave_high - wave_low) / _Point);
+    const string comment = StringFormat("WR%d", wave_range_points);
+
+    bool result = false;
+    if(pending_type == ORDER_TYPE_BUY_STOP)
+        result = trade.BuyStop(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+    else if(pending_type == ORDER_TYPE_SELL_STOP)
+        result = trade.SellStop(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+
+    if(!result) {
+        Print("挂单失败 ", EnumToString(pending_type), " 触发价:", trigger_price,
+              " 错误:", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+        return false;
+    }
+
+    Print("突破挂单成功 ", EnumToString(pending_type),
+          " 触发:", trigger_price, " 手数:", lots,
+          " SL:", sl, " TP:", tp,
+          " 波段 H:", wave_high, " L:", wave_low);
+    return true;
+}
+
+void SyncBreakoutPendingOrders()
+{
+    if(!latest_wave.exists) {
+        CancelEaPendingOrders(true, true);
+        g_sync_wave_high = 0.0;
+        g_sync_wave_low = 0.0;
+        return;
+    }
+
+    if(InpConsecutiveLosses > 0 && InpFreezeBarCount > 0 && freeze_bar_index > 0) {
+        const int current_bars = Bars(_Symbol, InpTimeframe);
+        if(current_bars < freeze_bar_index) {
+            CancelEaPendingOrders(true, true);
             return;
         }
-        else
-        {
-            // 冷冻期结束
-            if(freeze_bar_index > 0)
-            {
-                Print("【连续亏损保护】冷冻解除，恢复交易");
-                consecutive_loss_count = 0;
-                freeze_bar_index = 0;
-                freeze_until_time = 0;
-            }
+        if(freeze_bar_index > 0) {
+            Print("【连续亏损保护】冷冻解除，恢复交易");
+            consecutive_loss_count = 0;
+            freeze_bar_index = 0;
+            freeze_until_time = 0;
         }
     }
 
-    // 检查当前持仓数量和方向
+    if(MathAbs(latest_wave.high_price - g_sync_wave_high) > _Point * 0.5 ||
+       MathAbs(latest_wave.low_price - g_sync_wave_low) > _Point * 0.5) {
+        CancelEaPendingOrders(true, true);
+        g_sync_wave_high = latest_wave.high_price;
+        g_sync_wave_low = latest_wave.low_price;
+    }
+
     int total_positions = 0;
-    int buy_positions = 0;   // 多单数量
-    int sell_positions = 0;  // 空单数量
+    int buy_positions = 0;
+    int sell_positions = 0;
 
     for(int i = PositionsTotal() - 1; i >= 0; i--) {
         if(!PositionSelectByTicket(PositionGetTicket(i)))
@@ -673,11 +840,8 @@ void CheckOpenSignals()
             continue;
         if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
             continue;
-
         total_positions++;
-
-        // 统计各方向持仓数量
-        ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        const ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
         if(pos_type == POSITION_TYPE_BUY)
             buy_positions++;
         else if(pos_type == POSITION_TYPE_SELL)
@@ -685,226 +849,131 @@ void CheckOpenSignals()
     }
 
     if(total_positions >= InpMaxPositions) {
+        CancelEaPendingOrders(true, true);
         if(InpShowDebugInfo)
-            Print("已达最大持仓数量限制: ", total_positions, "/", InpMaxPositions);
+            Print("已达最大持仓笔数,撤销突破挂单: ", total_positions, "/", InpMaxPositions);
         return;
     }
 
-    double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    const double wave_high = latest_wave.high_price;
+    const double wave_low = latest_wave.low_price;
+    const double lots = CalculateLotSize(wave_high, wave_low);
 
-    // 计算当前波段的实际阈值（百分比模式：取高低点的平均值作为基准）
-    double base_price = (latest_wave.high_price + latest_wave.low_price) / 2.0;
-    double wave_threshold_points = (base_price * InpMinWavePercent / 100.0) / _Point;
-
-    // 检查多单信号：突破高点（且该高点未使用过）
-    if(!latest_wave.high_used && current_price > latest_wave.high_price) {
-        // 如果启用了单方向持仓限制，检查多单数量
-        if(InpOnePositionPerDirection && buy_positions >= 1) {
+    // 高点 BUY STOP
+    if(!latest_wave.high_used && (!InpOnePositionPerDirection || buy_positions < 1)) {
+        if(ask >= wave_high - _Point * 0.5) {
+            CancelEaPendingOrders(true, false);
             if(InpShowDebugInfo)
-                Print("多单信号被忽略 - 已有多单持仓: ", buy_positions);
+                Print("价格已越过波段高点,暂不挂BUY STOP Ask:", ask, " 高:", wave_high);
         } else {
-            if(InpShowDebugInfo)
-                Print("检测到多单信号 - 价格:", current_price, " 突破高点:", latest_wave.high_price);
-
-            if(OpenPosition(ORDER_TYPE_BUY, latest_wave.high_price, latest_wave.low_price, wave_threshold_points)) {
-                latest_wave.high_used = true;  // 标记高点已使用，该波段高点失效
-                if(InpShowDebugInfo)
-                    Print("高点已使用，等待新的有效波段");
+            ulong ticket = FindEaPendingOrder(ORDER_TYPE_BUY_STOP);
+            if(ticket > 0 && OrderSelect(ticket)) {
+                const double order_price = OrderGetDouble(ORDER_PRICE_OPEN);
+                const double order_lots = OrderGetDouble(ORDER_VOLUME_CURRENT);
+                if(MathAbs(order_price - wave_high) > _Point * 0.5 ||
+                   MathAbs(order_lots - lots) > 1e-8) {
+                    trade.OrderDelete(ticket);
+                    ticket = 0;
+                }
             }
+            if(ticket == 0)
+                PlaceBreakoutPendingOrder(ORDER_TYPE_BUY_STOP, wave_high, wave_high, wave_low);
         }
+    } else {
+        CancelEaPendingOrders(true, false);
     }
 
-    // 检查空单信号：突破低点（且该低点未使用过）
-    if(!latest_wave.low_used && current_price < latest_wave.low_price) {
-        // 如果启用了单方向持仓限制，检查空单数量
-        if(InpOnePositionPerDirection && sell_positions >= 1) {
+    // 低点 SELL STOP
+    if(!latest_wave.low_used && (!InpOnePositionPerDirection || sell_positions < 1)) {
+        if(bid <= wave_low + _Point * 0.5) {
+            CancelEaPendingOrders(false, true);
             if(InpShowDebugInfo)
-                Print("空单信号被忽略 - 已有空单持仓: ", sell_positions);
+                Print("价格已越过波段低点,暂不挂SELL STOP Bid:", bid, " 低:", wave_low);
         } else {
-            if(InpShowDebugInfo)
-                Print("检测到空单信号 - 价格:", current_price, " 突破低点:", latest_wave.low_price);
-
-            if(OpenPosition(ORDER_TYPE_SELL, latest_wave.high_price, latest_wave.low_price, wave_threshold_points)) {
-                latest_wave.low_used = true;  // 标记低点已使用，该波段低点失效
-                if(InpShowDebugInfo)
-                    Print("低点已使用，等待新的有效波段");
+            ulong ticket = FindEaPendingOrder(ORDER_TYPE_SELL_STOP);
+            if(ticket > 0 && OrderSelect(ticket)) {
+                const double order_price = OrderGetDouble(ORDER_PRICE_OPEN);
+                const double order_lots = OrderGetDouble(ORDER_VOLUME_CURRENT);
+                if(MathAbs(order_price - wave_low) > _Point * 0.5 ||
+                   MathAbs(order_lots - lots) > 1e-8) {
+                    trade.OrderDelete(ticket);
+                    ticket = 0;
+                }
             }
+            if(ticket == 0)
+                PlaceBreakoutPendingOrder(ORDER_TYPE_SELL_STOP, wave_low, wave_high, wave_low);
         }
+    } else {
+        CancelEaPendingOrders(false, true);
     }
 }
 
 //+------------------------------------------------------------------+
-//| 开仓                                                               |
+//| 止损/止盈距离(点数)                                                |
 //+------------------------------------------------------------------+
-bool OpenPosition(ENUM_ORDER_TYPE order_type, double wave_high, double wave_low, double threshold_points)
+double GetStopLossOffset()
 {
-    double lots = CalculateLotSize();
-    if(lots <= 0)
-        return false;
+    if(InpStopLossPoints <= 0)
+        return 0.0;
+    return (double)InpStopLossPoints * _Point;
+}
 
-    // 生成备注信息：盈亏比和最小止损点数
-    string comment = StringFormat("R%.1f SL%d",
-                                 InpRiskRewardRatio,
-                                 InpMinStopLossPoints);
+double GetTakeProfitOffset()
+{
+    if(InpTakeProfitPoints <= 0)
+        return 0.0;
+    return (double)InpTakeProfitPoints * _Point;
+}
 
-    bool result = false;
+double StopLossAmountFromPositionComment(const string &comment)
+{
+    return GetStopLossOffset();
+}
 
-    // 先以市价开仓（不带SL/TP），成交后再根据实际成交价设置SL/TP
-    if(order_type == ORDER_TYPE_BUY) {
-        result = trade.Buy(lots, _Symbol, 0, 0, 0, comment);
-    } else {
-        result = trade.Sell(lots, _Symbol, 0, 0, 0, comment);
-    }
+//+------------------------------------------------------------------+
+//| 手数规范化                                                         |
+//+------------------------------------------------------------------+
+double NormalizeVolumeLots(double lots)
+{
+    const double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    const double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    const double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-    if(!result) {
-        Print("开仓失败: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-        return false;
-    }
-
-    // 等待持仓信息更新
-    Sleep(100);
-
-    // 通过符号和魔术号查找刚开的持仓
-    ulong ticket = 0;
-    double open_price = 0;
-
-    for(int i = PositionsTotal() - 1; i >= 0; i--) {
-        if(!PositionSelectByTicket(PositionGetTicket(i)))
-            continue;
-
-        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-            continue;
-
-        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
-            continue;
-
-        // 找到最新的持仓（没有SL/TP的）
-        if(PositionGetDouble(POSITION_SL) == 0 && PositionGetDouble(POSITION_TP) == 0) {
-            ticket = PositionGetTicket(i);
-            open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-            break;
-        }
-    }
-
-    if(ticket == 0) {
-        Print("无法找到刚开的持仓");
-        return false;
-    }
-
-    // 基于实际成交价计算止损金额
-    double stop_loss_amount = open_price * InpStopLossPercent / 100.0;
-
-    // 确保止损金额不小于最小止损点数
-    double min_stop_loss = InpMinStopLossPoints * _Point;
-    if(stop_loss_amount < min_stop_loss) {
-        stop_loss_amount = min_stop_loss;
-    }
-
-    // 获取平台的最小止损距离
-    int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-    double min_stop_distance = stops_level * _Point;
-
-    // 获取当前市场价格
-    double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-    double sl = 0, tp = 0;
-
-    if(order_type == ORDER_TYPE_BUY) {
-        // 先标准化止损价
-        sl = NormalizeDouble(open_price - stop_loss_amount, _Digits);
-        // 根据标准化后的实际止损金额重新计算止盈金额，确保盈亏比准确
-        double actual_sl_amount = open_price - sl;
-        double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
-        tp = NormalizeDouble(open_price + take_profit_amount, _Digits);
-
-        // 检查止损距离（多单检查与Bid的距离）
-        if(stops_level > 0 && (current_bid - sl) < min_stop_distance) {
-            sl = NormalizeDouble(current_bid - min_stop_distance, _Digits);
-            // 重新计算止盈
-            actual_sl_amount = open_price - sl;
-            take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
-            tp = NormalizeDouble(open_price + take_profit_amount, _Digits);
-            Print("止损距离不足，已调整 - 新止损:", sl);
-        }
-
-        // 检查止盈距离
-        if(stops_level > 0 && (tp - current_ask) < min_stop_distance) {
-            tp = NormalizeDouble(current_ask + min_stop_distance, _Digits);
-            Print("止盈距离不足，已调整 - 新止盈:", tp);
-        }
-    } else {
-        // 先标准化止损价
-        sl = NormalizeDouble(open_price + stop_loss_amount, _Digits);
-        // 根据标准化后的实际止损金额重新计算止盈金额，确保盈亏比准确
-        double actual_sl_amount = sl - open_price;
-        double take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
-        tp = NormalizeDouble(open_price - take_profit_amount, _Digits);
-
-        // 检查止损距离（空单检查与Ask的距离）
-        if(stops_level > 0 && (sl - current_ask) < min_stop_distance) {
-            sl = NormalizeDouble(current_ask + min_stop_distance, _Digits);
-            // 重新计算止盈
-            actual_sl_amount = sl - open_price;
-            take_profit_amount = actual_sl_amount * InpRiskRewardRatio;
-            tp = NormalizeDouble(open_price - take_profit_amount, _Digits);
-            Print("止损距离不足，已调整 - 新止损:", sl);
-        }
-
-        // 检查止盈距离
-        if(stops_level > 0 && (current_bid - tp) < min_stop_distance) {
-            tp = NormalizeDouble(current_bid - min_stop_distance, _Digits);
-            Print("止盈距离不足，已调整 - 新止盈:", tp);
-        }
-    }
-
-    // 修改持仓的SL/TP
-    if(!trade.PositionModify(ticket, sl, tp)) {
-        Print("修改SL/TP失败 - Ticket:", ticket,
-              " 错误码:", trade.ResultRetcode(),
-              " 描述:", trade.ResultRetcodeDescription(),
-              " 止损:", sl, " 止盈:", tp,
-              " 平台最小距离:", stops_level, "点");
-        return false;
-    }
-
-    Print(order_type == ORDER_TYPE_BUY ? "开多单成功" : "开空单成功",
-          " - 手数:", lots,
-          " 波段:H:", wave_high, " L:", wave_low,
-          " 实际成交价:", open_price,
-          " 止损:", sl, "(", InpStopLossPercent, "%)",
-          " 止盈:", tp, "(盈亏比", InpRiskRewardRatio, ")");
-
-    return true;
+    if(InpMaxLots > 0.0)
+        lots = MathMin(lots, InpMaxLots);
+    if(lots < min_lot)
+        lots = min_lot;
+    if(lots > max_lot)
+        lots = max_lot;
+    if(lot_step > 0.0)
+        lots = MathFloor(lots / lot_step) * lot_step;
+    return lots;
 }
 
 //+------------------------------------------------------------------+
 //| 计算开仓手数                                                       |
 //+------------------------------------------------------------------+
-double CalculateLotSize()
+double CalculateLotSize(const double wave_high, const double wave_low)
 {
-    double lots = 0;
+    double lots = InpFixedLots;
 
-    if(InpUseCompounding) {
-        // 复利模式
-        double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-        lots = NormalizeDouble((balance / 500.0) * InpLotsPer500, 2);
-    } else {
-        // 固定手数模式
-        lots = InpFixedLots;
+    if(InpLotSizeMode == LOT_SIZE_RISK_PERCENT && InpRiskPercent > 0.0) {
+        const double stop_loss_dist = GetStopLossOffset();
+        const double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+        const double risk_money = balance * InpRiskPercent / 100.0;
+
+        const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+        const double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+        if(stop_loss_dist > 0.0 && tick_size > 0.0 && tick_value > 0.0 && risk_money > 0.0) {
+            const double loss_per_lot = (stop_loss_dist / tick_size) * tick_value;
+            if(loss_per_lot > 0.0)
+                lots = risk_money / loss_per_lot;
+        }
     }
 
-    // 检查手数限制
-    double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-    if(lots < min_lot) lots = min_lot;
-    if(lots > max_lot) lots = max_lot;
-
-    lots = MathFloor(lots / lot_step) * lot_step;
-
-    return lots;
+    return NormalizeVolumeLots(lots);
 }
 
 //+------------------------------------------------------------------+
@@ -947,14 +1016,9 @@ void CheckTrailingStop(ulong ticket)
                            SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                            SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-    // 计算止损金额（开仓价的百分比）
-    double stop_loss_amount = open_price * InpStopLossPercent / 100.0;
-
-    // 确保止损金额不小于最小止损点数
-    double min_stop_loss = InpMinStopLossPoints * _Point;
-    if(stop_loss_amount < min_stop_loss) {
-        stop_loss_amount = min_stop_loss;
-    }
+    // 计算止损金额（有效波段区间 × 比例，备注中 WR 存区间点数）
+    const string comment = PositionGetString(POSITION_COMMENT);
+    const double stop_loss_amount = StopLossAmountFromPositionComment(comment);
 
     // 计算浮盈
     double profit_amount = 0;
