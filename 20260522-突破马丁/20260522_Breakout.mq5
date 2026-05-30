@@ -3,7 +3,7 @@
 //|                                      突破策略 - 单笔突破开仓        |
 //+------------------------------------------------------------------+
 #property copyright "Breakout Strategy"
-#property version   "3.18"
+#property version   "3.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -30,7 +30,7 @@ input group "=== 波段识别参数 ==="
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1; // K线周期
 input int      InpMAPeriod = 14;                // MA周期
 input double   InpMinWavePercent = 0.1;         // 最小波段阈值百分比(%)
-input double   InpMaxWavePercent = 0.25;        // 最大波段阈值百分比(%)
+input double   InpMaxWavePercent = 1.0;         // 最大波段阈值百分比(%)
 input double   InpPullbackTolerance = 0.05;     // 反向突破容忍度(%) 0=不容忍
 input int      InpMinWaveBars = 3;              // 有效波段最少K线数(含两端极值所在K)
 
@@ -39,17 +39,17 @@ input ENUM_BREAKOUT_DIRECTION InpBreakoutDirection = BREAKOUT_DIR_RANDOM; // 开
 input double   InpDailyMADevThreshold = 1.0;    // 日MA偏离率阈值(%),|偏离|超过才触发反向,0=关
 input int      InpBatchTakeProfitPoints = 300;  // 按批统盈点数(0=关):均价±点数平该批
 input double   InpStopLossBalancePct = 30.0;    // 止损:持仓浮亏达结余比例(%)全部清仓,0=关
-input double   InpLargeLotMinVolume = 1.0;      // 大单独立止盈手数阈值(>=,0=关)
-input int      InpLargeLotTakeProfitPoints = 500; // 大单最大止盈点数(0=关,不参与统盈)
-input bool     InpEnablePullbackReverse = true; // 启用突破回落反向
+input double   InpLargeLotMinVolume = 0.0;      // 大单独立止盈手数阈值(>=,0=关)
+input int      InpLargeLotTakeProfitPoints = 0; // 大单最大止盈点数(0=关,不参与统盈)
+input bool     InpEnablePullbackReverse = false; // 启用突破回落反向
 input int      InpPullbackReverseWatchBars = 3; // 回落监测K线数(突破K+后2根=3)
 
 input group "=== 仓位管理参数 ==="
 input string   InpTierLotsList =
-   "0.05,0.05,0.05,0.8,0.8,1.1,1,2,2,1,1,1,2,2,1,1,1,5,5"; // 各档手数(逗号分隔,档数=最多开仓笔数)
+   "0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,5,4,3,2,1,5"; // 各档手数(逗号分隔,档数=最多开仓笔数)
 input double   InpMaxLots = 99.0;             // 同向最大合计手数(0=不限制)
 input double   InpMinSameDirAddSpacingPercent = 0.0; // 同向最小开仓间距(%) 0=不限制
-input ENUM_DUAL_FULL_ACTION InpDualFullAction = DUAL_FULL_CLEAR_ALL; // 双向满档后处理
+input ENUM_DUAL_FULL_ACTION InpDualFullAction = DUAL_FULL_NEW_ROUND; // 双向满档后处理
 
 input group "=== 调试选项 ==="
 input bool     InpShowDebugInfo = false;        // 显示调试信息
@@ -131,6 +131,8 @@ int CountAllBreakoutPositions();
 double TotalLotsInDirection(const long pos_type);
 bool IsDirectionFullActive(const long pos_type);
 void ResetBreakoutWaveEntryFlags();
+void ResetTradingStateAfterManualClose();
+bool IsManualDealCloseReason(const long reason);
 void CheckDualSideFullCapacity();
 double NormalizeVolume(double lots);
 bool InitTierLotsFromInput();
@@ -1173,6 +1175,24 @@ void ResetBreakoutWaveEntryFlags()
     g_low_pullback_watch.active = false;
 }
 
+bool IsManualDealCloseReason(const long reason)
+{
+    return (reason == DEAL_REASON_CLIENT ||
+            reason == DEAL_REASON_MOBILE ||
+            reason == DEAL_REASON_WEB);
+}
+
+void ResetTradingStateAfterManualClose()
+{
+    g_trade_round = 1;
+    g_dual_full_handled = false;
+    ResetBreakoutWaveEntryFlags();
+    g_breakout_opened_on_bar_high = false;
+    g_breakout_opened_on_bar_low = false;
+    g_pullback_opened_on_bar_high = false;
+    g_pullback_opened_on_bar_low = false;
+}
+
 int CountAllBreakoutPositions()
 {
     int count = 0;
@@ -1974,7 +1994,7 @@ void CheckAndCloseManualOrders()
 }
 
 //+------------------------------------------------------------------+
-//| 成交事件(大单被平台TP平仓时重置满档状态)                              |
+//| 成交事件(手动平仓重置状态 / 大单TP重置满档)                           |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
@@ -1990,18 +2010,27 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
         return;
     if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
         return;
-    if(HistoryDealGetInteger(trans.deal, DEAL_REASON) != DEAL_REASON_TP)
-        return;
 
     const string comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
     if(!IsEaBreakoutComment(comment))
         return;
 
+    const long reason = HistoryDealGetInteger(trans.deal, DEAL_REASON);
     const double vol = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+    const int round_id = ParseRoundFromComment(comment);
+
+    if(IsManualDealCloseReason(reason)) {
+        ResetTradingStateAfterManualClose();
+        Print("【手动平仓】已重置轮次/满档/极值锁 手数:", vol, " 原轮次:", round_id,
+              " 备注:", comment, " (马丁档按剩余第1轮持仓重计)");
+        return;
+    }
+
+    if(reason != DEAL_REASON_TP)
+        return;
     if(!IsLargeLotVolume(vol))
         return;
 
-    const int round_id = ParseRoundFromComment(comment);
     if(round_id == g_trade_round)
         g_dual_full_handled = false;
 

@@ -3,7 +3,7 @@
 //|                                      突破交易策略 - 完整交易版本    |
 //+------------------------------------------------------------------+
 #property copyright "Breakout Strategy"
-#property version   "1.01"
+#property version   "1.03"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -12,6 +12,12 @@
 enum ENUM_LOT_SIZE_MODE {
     LOT_SIZE_FIXED = 0,        // 固定手数
     LOT_SIZE_RISK_PERCENT = 1  // 结余风险比例(RiskPercent)
+};
+
+// 破高/破低开仓方向
+enum ENUM_BREAKOUT_DIRECTION {
+    BREAKOUT_DIR_FOLLOW = 0,  // 顺势(破高多/破低空)
+    BREAKOUT_DIR_REVERSE = 1  // 反向(破高空/破低多)
 };
 
 //+------------------------------------------------------------------+
@@ -24,6 +30,11 @@ input double   InpMinWavePercent = 0.1;         // 最小波段阈值百分比(%
 input double   InpMaxWavePercent = 10.0;        // 最大波段阈值百分比(%)
 input double   InpPullbackTolerance = 0.0;      // 反向突破容忍度(%) 0=不容忍
 input int      InpMinWaveBars = 3;              // 有效波段最少K线数(含两端极值所在K)
+
+input group "=== 突破交易参数 ==="
+input ENUM_BREAKOUT_DIRECTION InpBreakoutDirection = BREAKOUT_DIR_FOLLOW; // 开仓方向
+input bool     InpEnablePullbackReverse = false; // 启用突破回落反向
+input int      InpPullbackReverseWatchBars = 3; // 回落监测K线数(突破K+后2根=3)
 
 input group "=== 风险管理参数 ==="
 input int      InpStopLossPoints = 200;         // 止损点数
@@ -60,11 +71,26 @@ struct ValidWaveInfo {
     double high_price;                          // 高点价格
     double low_price;                           // 低点价格
     datetime update_time;                       // 更新时间
-    bool high_used;                             // 高点是否已使用
-    bool low_used;                              // 低点是否已使用
+    bool high_used;                             // 高点-突破挂单已用(每极值限1次)
+    bool low_used;                              // 低点-突破挂单已用(每极值限1次)
+    bool high_pullback_reverse_used;            // 高点-回落反向已用(每极值限1次)
+    bool low_pullback_reverse_used;             // 低点-回落反向已用(每极值限1次)
+};
+
+struct PullbackWatchState {
+    bool active;
+    double extreme_price;
+    int bars_checked;
 };
 
 ValidWaveInfo latest_wave;                      // 最新有效波段
+
+PullbackWatchState g_high_pullback_watch;
+PullbackWatchState g_low_pullback_watch;
+datetime g_pullback_bar_time_high = 0;
+bool g_pullback_opened_on_bar_high = false;
+datetime g_pullback_bar_time_low = 0;
+bool g_pullback_opened_on_bar_low = false;
 
 double g_sync_wave_high = 0.0;                  // 已挂单的波段高价(用于检测换波段)
 double g_sync_wave_low = 0.0;
@@ -92,8 +118,17 @@ int CheckBreakout(int index, const MqlRates &rates[], const double &ma[]);
 void FilterBreakouts(const int &breakout_bars[], const int &breakout_types[],
                     const MqlRates &rates[], int &filtered_bars[], int &filtered_types[]);
 void SyncBreakoutPendingOrders();
-void CancelEaPendingOrders(const bool cancel_buy_stop, const bool cancel_sell_stop);
+void CancelAllEaPendingOrders();
+void CancelEaPendingOrderType(const ENUM_ORDER_TYPE order_type);
+void CancelEaPendingAtHigh();
+void CancelEaPendingAtLow();
 ulong FindEaPendingOrder(const ENUM_ORDER_TYPE order_type);
+ENUM_ORDER_TYPE PendingTypeOnHighBreakout();
+ENUM_ORDER_TYPE PendingTypeOnLowBreakout();
+long PosTypeOnHighBreakout();
+long PosTypeOnLowBreakout();
+void SyncPendingAtExtreme(const bool at_high, const double trigger_price,
+                          const double wave_high, const double wave_low, const double lots);
 bool CalcPendingSlTp(const ENUM_ORDER_TYPE pending_type, const double trigger_price, double &sl, double &tp);
 bool PlaceBreakoutPendingOrder(const ENUM_ORDER_TYPE pending_type, const double trigger_price,
                                const double wave_high, const double wave_low);
@@ -105,6 +140,20 @@ double NormalizeVolumeLots(double lots);
 void ManagePositions();
 void CheckTrailingStop(ulong ticket);
 void CheckAndCloseManualOrders();
+void CheckPullbackReverseSignals();
+void TryArmPullbackWatch();
+void ProcessPullbackReverseOnNewBar();
+ENUM_ORDER_TYPE OrderTypeOnHighPullbackReverse();
+ENUM_ORDER_TYPE OrderTypeOnLowPullbackReverse();
+bool IsPullbackBarOpenAllowed(const bool for_high_extreme);
+void MarkPullbackBarOpened(const bool for_high_extreme);
+void SyncPullbackBarLock(const bool for_high_extreme);
+bool IsPullbackOpenBlocked();
+bool OpenPullbackReversePosition(ENUM_ORDER_TYPE order_type, const bool from_high_extreme,
+                                 const double extreme_price, const double wave_high,
+                                 const double wave_low);
+bool CalcMarketSlTp(const ENUM_ORDER_TYPE order_type, const double entry_price, double &sl,
+                    double &tp);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -130,6 +179,10 @@ int OnInit()
     latest_wave.update_time = 0;
     latest_wave.high_used = false;
     latest_wave.low_used = false;
+    latest_wave.high_pullback_reverse_used = false;
+    latest_wave.low_pullback_reverse_used = false;
+    g_high_pullback_watch.active = false;
+    g_low_pullback_watch.active = false;
 
     Print("========================================");
     Print("突破交易策略EA初始化成功");
@@ -154,7 +207,15 @@ int OnInit()
         Print("手数模式: 结余风险比例 ", InpRiskPercent, "% (按止损距离反推手数)");
     else
         Print("手数模式: 固定手数 ", InpFixedLots);
-    Print("开仓方式: 突破挂单 (高点BUY STOP / 低点SELL STOP)");
+    if(InpBreakoutDirection == BREAKOUT_DIR_FOLLOW)
+        Print("开仓方向: 顺势(破高多/破低空) 挂单: 高BUY STOP / 低SELL STOP");
+    else
+        Print("开仓方向: 反向(破高空/破低多) 挂单: 高SELL LIMIT / 低BUY LIMIT");
+    if(InpEnablePullbackReverse)
+        Print("回落反向: 开 破极值后监测", InpPullbackReverseWatchBars,
+              "根K收盘回到极值内开反向单(与突破挂单独立)");
+    else
+        Print("回落反向: 关");
     Print("禁止手工单:", (InpCloseManualOrders ? "启用 (自动平掉手工单)" : "禁用"));
     Print("========================================");
 
@@ -171,7 +232,7 @@ void OnDeinit(const int reason)
 
     // 删除所有标记
     ObjectsDeleteAll(0, "ValidWave_");
-    CancelEaPendingOrders(true, true);
+    CancelAllEaPendingOrders();
 
     Print("突破交易策略EA已卸载");
 }
@@ -188,12 +249,22 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) == _Symbol &&
                HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == InpMagicNumber &&
                HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_IN) {
-                const ENUM_DEAL_TYPE deal_type =
-                    (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
-                if(deal_type == DEAL_TYPE_BUY)
-                    latest_wave.high_used = true;
-                else if(deal_type == DEAL_TYPE_SELL)
-                    latest_wave.low_used = true;
+                const string deal_comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+                if(StringFind(deal_comment, "-PB") < 0) {
+                    const ENUM_DEAL_TYPE deal_type =
+                        (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+                    if(deal_type == DEAL_TYPE_BUY) {
+                        if(PosTypeOnHighBreakout() == POSITION_TYPE_BUY)
+                            latest_wave.high_used = true;
+                        else if(PosTypeOnLowBreakout() == POSITION_TYPE_BUY)
+                            latest_wave.low_used = true;
+                    } else if(deal_type == DEAL_TYPE_SELL) {
+                        if(PosTypeOnHighBreakout() == POSITION_TYPE_SELL)
+                            latest_wave.high_used = true;
+                        else if(PosTypeOnLowBreakout() == POSITION_TYPE_SELL)
+                            latest_wave.low_used = true;
+                    }
+                }
             }
         }
     }
@@ -276,10 +347,13 @@ void OnTick()
     // 2. 更新最新有效波段
     UpdateLatestValidWave();
 
-    // 3. 同步突破挂单(BUY STOP@高 / SELL STOP@低)
+    // 3. 突破回落反向(破极值后K线收盘回到极值内,与突破挂单独立)
+    CheckPullbackReverseSignals();
+
+    // 4. 同步突破挂单(顺势/反向由 InpBreakoutDirection 决定)
     SyncBreakoutPendingOrders();
 
-    // 4. 管理已有持仓
+    // 5. 管理已有持仓
     ManagePositions();
 }
 
@@ -552,12 +626,24 @@ void UpdateLatestValidWave()
                high != latest_wave.high_price ||
                low != latest_wave.low_price) {
 
+                const double prev_high = latest_wave.high_price;
+                const double prev_low = latest_wave.low_price;
+
                 latest_wave.exists = true;
                 latest_wave.high_price = high;
                 latest_wave.low_price = low;
                 latest_wave.update_time = extremes[i].time;
-                latest_wave.high_used = false;  // 新波段，重置使用状态
-                latest_wave.low_used = false;
+
+                if(high != prev_high) {
+                    latest_wave.high_used = false;
+                    latest_wave.high_pullback_reverse_used = false;
+                    g_high_pullback_watch.active = false;
+                }
+                if(low != prev_low) {
+                    latest_wave.low_used = false;
+                    latest_wave.low_pullback_reverse_used = false;
+                    g_low_pullback_watch.active = false;
+                }
 
                 // 绘制最新有效波段
                 if(InpShowMarkers) {
@@ -697,23 +783,57 @@ void FilterBreakouts(const int &breakout_bars[], const int &breakout_types[],
 //+------------------------------------------------------------------+
 //| 突破挂单管理                                                       |
 //+------------------------------------------------------------------+
-void CancelEaPendingOrders(const bool cancel_buy_stop, const bool cancel_sell_stop)
+long PosTypeOnHighBreakout()
 {
-    for(int i = OrdersTotal() - 1; i >= 0; i--) {
-        const ulong ticket = OrderGetTicket(i);
-        if(ticket == 0 || !OrderSelect(ticket))
-            continue;
-        if(OrderGetString(ORDER_SYMBOL) != _Symbol)
-            continue;
-        if(OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
-            continue;
+    if(InpBreakoutDirection == BREAKOUT_DIR_REVERSE)
+        return POSITION_TYPE_SELL;
+    return POSITION_TYPE_BUY;
+}
 
-        const ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-        if(cancel_buy_stop && ot == ORDER_TYPE_BUY_STOP)
-            trade.OrderDelete(ticket);
-        else if(cancel_sell_stop && ot == ORDER_TYPE_SELL_STOP)
-            trade.OrderDelete(ticket);
-    }
+long PosTypeOnLowBreakout()
+{
+    if(InpBreakoutDirection == BREAKOUT_DIR_REVERSE)
+        return POSITION_TYPE_BUY;
+    return POSITION_TYPE_SELL;
+}
+
+ENUM_ORDER_TYPE PendingTypeOnHighBreakout()
+{
+    if(InpBreakoutDirection == BREAKOUT_DIR_REVERSE)
+        return ORDER_TYPE_SELL_LIMIT;
+    return ORDER_TYPE_BUY_STOP;
+}
+
+ENUM_ORDER_TYPE PendingTypeOnLowBreakout()
+{
+    if(InpBreakoutDirection == BREAKOUT_DIR_REVERSE)
+        return ORDER_TYPE_BUY_LIMIT;
+    return ORDER_TYPE_SELL_STOP;
+}
+
+void CancelEaPendingOrderType(const ENUM_ORDER_TYPE order_type)
+{
+    const ulong ticket = FindEaPendingOrder(order_type);
+    if(ticket > 0)
+        trade.OrderDelete(ticket);
+}
+
+void CancelEaPendingAtHigh()
+{
+    CancelEaPendingOrderType(ORDER_TYPE_BUY_STOP);
+    CancelEaPendingOrderType(ORDER_TYPE_SELL_LIMIT);
+}
+
+void CancelEaPendingAtLow()
+{
+    CancelEaPendingOrderType(ORDER_TYPE_SELL_STOP);
+    CancelEaPendingOrderType(ORDER_TYPE_BUY_LIMIT);
+}
+
+void CancelAllEaPendingOrders()
+{
+    CancelEaPendingAtHigh();
+    CancelEaPendingAtLow();
 }
 
 ulong FindEaPendingOrder(const ENUM_ORDER_TYPE order_type)
@@ -742,7 +862,7 @@ bool CalcPendingSlTp(const ENUM_ORDER_TYPE pending_type, const double trigger_pr
     sl = 0.0;
     tp = 0.0;
 
-    if(pending_type == ORDER_TYPE_BUY_STOP) {
+    if(pending_type == ORDER_TYPE_BUY_STOP || pending_type == ORDER_TYPE_BUY_LIMIT) {
         sl = NormalizeDouble(trigger_price - stop_loss_amount, _Digits);
         tp = NormalizeDouble(trigger_price + take_profit_amount, _Digits);
         if(stops_level > 0) {
@@ -751,7 +871,7 @@ bool CalcPendingSlTp(const ENUM_ORDER_TYPE pending_type, const double trigger_pr
             if(tp - trigger_price < min_stop_distance)
                 tp = NormalizeDouble(trigger_price + min_stop_distance, _Digits);
         }
-    } else if(pending_type == ORDER_TYPE_SELL_STOP) {
+    } else if(pending_type == ORDER_TYPE_SELL_STOP || pending_type == ORDER_TYPE_SELL_LIMIT) {
         sl = NormalizeDouble(trigger_price + stop_loss_amount, _Digits);
         tp = NormalizeDouble(trigger_price - take_profit_amount, _Digits);
         if(stops_level > 0) {
@@ -785,6 +905,10 @@ bool PlaceBreakoutPendingOrder(const ENUM_ORDER_TYPE pending_type, const double 
         result = trade.BuyStop(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
     else if(pending_type == ORDER_TYPE_SELL_STOP)
         result = trade.SellStop(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+    else if(pending_type == ORDER_TYPE_BUY_LIMIT)
+        result = trade.BuyLimit(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+    else if(pending_type == ORDER_TYPE_SELL_LIMIT)
+        result = trade.SellLimit(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
 
     if(!result) {
         Print("挂单失败 ", EnumToString(pending_type), " 触发价:", trigger_price,
@@ -799,10 +923,54 @@ bool PlaceBreakoutPendingOrder(const ENUM_ORDER_TYPE pending_type, const double 
     return true;
 }
 
+void SyncPendingAtExtreme(const bool at_high, const double trigger_price,
+                          const double wave_high, const double wave_low,
+                          const double lots)
+{
+    const ENUM_ORDER_TYPE pending_type = at_high ?
+        PendingTypeOnHighBreakout() : PendingTypeOnLowBreakout();
+    const ENUM_ORDER_TYPE stale_type = at_high ?
+        (pending_type == ORDER_TYPE_BUY_STOP ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_BUY_STOP) :
+        (pending_type == ORDER_TYPE_SELL_STOP ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_STOP);
+    CancelEaPendingOrderType(stale_type);
+
+    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    const bool price_crossed = at_high ?
+        (ask >= trigger_price - _Point * 0.5) :
+        (bid <= trigger_price + _Point * 0.5);
+
+    if(price_crossed) {
+        if(at_high)
+            CancelEaPendingAtHigh();
+        else
+            CancelEaPendingAtLow();
+        if(InpShowDebugInfo)
+            Print("价格已越过波段", (at_high ? "高点" : "低点"),
+                  ",暂不挂", EnumToString(pending_type),
+                  " ", (at_high ? "Ask:" : "Bid:"),
+                  (at_high ? ask : bid), " 极值:", trigger_price);
+        return;
+    }
+
+    ulong ticket = FindEaPendingOrder(pending_type);
+    if(ticket > 0 && OrderSelect(ticket)) {
+        const double order_price = OrderGetDouble(ORDER_PRICE_OPEN);
+        const double order_lots = OrderGetDouble(ORDER_VOLUME_CURRENT);
+        if(MathAbs(order_price - trigger_price) > _Point * 0.5 ||
+           MathAbs(order_lots - lots) > 1e-8) {
+            trade.OrderDelete(ticket);
+            ticket = 0;
+        }
+    }
+    if(ticket == 0)
+        PlaceBreakoutPendingOrder(pending_type, trigger_price, wave_high, wave_low);
+}
+
 void SyncBreakoutPendingOrders()
 {
     if(!latest_wave.exists) {
-        CancelEaPendingOrders(true, true);
+        CancelAllEaPendingOrders();
         g_sync_wave_high = 0.0;
         g_sync_wave_low = 0.0;
         return;
@@ -811,7 +979,7 @@ void SyncBreakoutPendingOrders()
     if(InpConsecutiveLosses > 0 && InpFreezeBarCount > 0 && freeze_bar_index > 0) {
         const int current_bars = Bars(_Symbol, InpTimeframe);
         if(current_bars < freeze_bar_index) {
-            CancelEaPendingOrders(true, true);
+            CancelAllEaPendingOrders();
             return;
         }
         if(freeze_bar_index > 0) {
@@ -824,7 +992,7 @@ void SyncBreakoutPendingOrders()
 
     if(MathAbs(latest_wave.high_price - g_sync_wave_high) > _Point * 0.5 ||
        MathAbs(latest_wave.low_price - g_sync_wave_low) > _Point * 0.5) {
-        CancelEaPendingOrders(true, true);
+        CancelAllEaPendingOrders();
         g_sync_wave_high = latest_wave.high_price;
         g_sync_wave_low = latest_wave.low_price;
     }
@@ -849,65 +1017,294 @@ void SyncBreakoutPendingOrders()
     }
 
     if(total_positions >= InpMaxPositions) {
-        CancelEaPendingOrders(true, true);
+        CancelAllEaPendingOrders();
         if(InpShowDebugInfo)
             Print("已达最大持仓笔数,撤销突破挂单: ", total_positions, "/", InpMaxPositions);
         return;
     }
 
-    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     const double wave_high = latest_wave.high_price;
     const double wave_low = latest_wave.low_price;
     const double lots = CalculateLotSize(wave_high, wave_low);
 
-    // 高点 BUY STOP
-    if(!latest_wave.high_used && (!InpOnePositionPerDirection || buy_positions < 1)) {
-        if(ask >= wave_high - _Point * 0.5) {
-            CancelEaPendingOrders(true, false);
-            if(InpShowDebugInfo)
-                Print("价格已越过波段高点,暂不挂BUY STOP Ask:", ask, " 高:", wave_high);
-        } else {
-            ulong ticket = FindEaPendingOrder(ORDER_TYPE_BUY_STOP);
-            if(ticket > 0 && OrderSelect(ticket)) {
-                const double order_price = OrderGetDouble(ORDER_PRICE_OPEN);
-                const double order_lots = OrderGetDouble(ORDER_VOLUME_CURRENT);
-                if(MathAbs(order_price - wave_high) > _Point * 0.5 ||
-                   MathAbs(order_lots - lots) > 1e-8) {
-                    trade.OrderDelete(ticket);
-                    ticket = 0;
-                }
-            }
-            if(ticket == 0)
-                PlaceBreakoutPendingOrder(ORDER_TYPE_BUY_STOP, wave_high, wave_high, wave_low);
-        }
+    const long high_pos_type = PosTypeOnHighBreakout();
+    const long low_pos_type = PosTypeOnLowBreakout();
+    const int high_dir_positions = (high_pos_type == POSITION_TYPE_BUY) ?
+        buy_positions : sell_positions;
+    const int low_dir_positions = (low_pos_type == POSITION_TYPE_BUY) ?
+        buy_positions : sell_positions;
+
+    if(!latest_wave.high_used &&
+       (!InpOnePositionPerDirection || high_dir_positions < 1)) {
+        SyncPendingAtExtreme(true, wave_high, wave_high, wave_low, lots);
     } else {
-        CancelEaPendingOrders(true, false);
+        CancelEaPendingAtHigh();
     }
 
-    // 低点 SELL STOP
-    if(!latest_wave.low_used && (!InpOnePositionPerDirection || sell_positions < 1)) {
-        if(bid <= wave_low + _Point * 0.5) {
-            CancelEaPendingOrders(false, true);
-            if(InpShowDebugInfo)
-                Print("价格已越过波段低点,暂不挂SELL STOP Bid:", bid, " 低:", wave_low);
-        } else {
-            ulong ticket = FindEaPendingOrder(ORDER_TYPE_SELL_STOP);
-            if(ticket > 0 && OrderSelect(ticket)) {
-                const double order_price = OrderGetDouble(ORDER_PRICE_OPEN);
-                const double order_lots = OrderGetDouble(ORDER_VOLUME_CURRENT);
-                if(MathAbs(order_price - wave_low) > _Point * 0.5 ||
-                   MathAbs(order_lots - lots) > 1e-8) {
-                    trade.OrderDelete(ticket);
-                    ticket = 0;
-                }
-            }
-            if(ticket == 0)
-                PlaceBreakoutPendingOrder(ORDER_TYPE_SELL_STOP, wave_low, wave_high, wave_low);
+    if(!latest_wave.low_used &&
+       (!InpOnePositionPerDirection || low_dir_positions < 1)) {
+        SyncPendingAtExtreme(false, wave_low, wave_high, wave_low, lots);
+    } else {
+        CancelEaPendingAtLow();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 突破回落反向(破极值后收盘回到极值内开反向单,与突破挂单独立)            |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE OrderTypeOnHighPullbackReverse()
+{
+    return ORDER_TYPE_SELL;
+}
+
+ENUM_ORDER_TYPE OrderTypeOnLowPullbackReverse()
+{
+    return ORDER_TYPE_BUY;
+}
+
+void SyncPullbackBarLock(const bool for_high_extreme)
+{
+    const datetime bar_time = iTime(_Symbol, InpTimeframe, 0);
+    if(bar_time == 0)
+        return;
+    if(for_high_extreme) {
+        if(bar_time != g_pullback_bar_time_high) {
+            g_pullback_bar_time_high = bar_time;
+            g_pullback_opened_on_bar_high = false;
         }
     } else {
-        CancelEaPendingOrders(false, true);
+        if(bar_time != g_pullback_bar_time_low) {
+            g_pullback_bar_time_low = bar_time;
+            g_pullback_opened_on_bar_low = false;
+        }
     }
+}
+
+bool IsPullbackBarOpenAllowed(const bool for_high_extreme)
+{
+    SyncPullbackBarLock(for_high_extreme);
+    if(for_high_extreme)
+        return !g_pullback_opened_on_bar_high;
+    return !g_pullback_opened_on_bar_low;
+}
+
+void MarkPullbackBarOpened(const bool for_high_extreme)
+{
+    SyncPullbackBarLock(for_high_extreme);
+    if(for_high_extreme)
+        g_pullback_opened_on_bar_high = true;
+    else
+        g_pullback_opened_on_bar_low = true;
+}
+
+bool IsPullbackOpenBlocked()
+{
+    if(InpConsecutiveLosses > 0 && InpFreezeBarCount > 0 && freeze_bar_index > 0) {
+        if(Bars(_Symbol, InpTimeframe) < freeze_bar_index)
+            return true;
+    }
+
+    int total_positions = 0;
+    int buy_positions = 0;
+    int sell_positions = 0;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+        total_positions++;
+        const ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        if(pos_type == POSITION_TYPE_BUY)
+            buy_positions++;
+        else if(pos_type == POSITION_TYPE_SELL)
+            sell_positions++;
+    }
+
+    if(total_positions >= InpMaxPositions)
+        return true;
+
+    return false;
+}
+
+bool IsPullbackDirectionBlocked(const ENUM_ORDER_TYPE order_type)
+{
+    if(!InpOnePositionPerDirection)
+        return false;
+
+    const long pos_type = (order_type == ORDER_TYPE_BUY) ?
+        POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!PositionSelectByTicket(PositionGetTicket(i)))
+            continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+        if(PositionGetInteger(POSITION_TYPE) == pos_type)
+            return true;
+    }
+    return false;
+}
+
+bool CalcMarketSlTp(const ENUM_ORDER_TYPE order_type, const double entry_price, double &sl,
+                    double &tp)
+{
+    const ENUM_ORDER_TYPE pending_equiv = (order_type == ORDER_TYPE_BUY) ?
+        ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+    return CalcPendingSlTp(pending_equiv, entry_price, sl, tp);
+}
+
+bool OpenPullbackReversePosition(ENUM_ORDER_TYPE order_type, const bool from_high_extreme,
+                                 const double extreme_price, const double wave_high,
+                                 const double wave_low)
+{
+    if(!IsPullbackBarOpenAllowed(from_high_extreme))
+        return false;
+
+    if(IsPullbackOpenBlocked()) {
+        if(InpShowDebugInfo)
+            Print("【回落反向】开仓跳过 - 冷冻中或已达最大持仓笔数");
+        return false;
+    }
+
+    if(IsPullbackDirectionBlocked(order_type)) {
+        if(InpShowDebugInfo)
+            Print("【回落反向】开仓跳过 - 同向已有持仓");
+        return false;
+    }
+
+    const double lots = CalculateLotSize(wave_high, wave_low);
+    if(lots <= 0.0)
+        return false;
+
+    const double entry_price = (order_type == ORDER_TYPE_BUY) ?
+        SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
+        SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    double sl = 0.0, tp = 0.0;
+    if(!CalcMarketSlTp(order_type, entry_price, sl, tp))
+        return false;
+
+    const int wave_range_points = (int)MathRound(MathAbs(wave_high - wave_low) / _Point);
+    const string comment = StringFormat("WR%d-PB", wave_range_points);
+
+    bool result = false;
+    if(order_type == ORDER_TYPE_BUY)
+        result = trade.Buy(lots, _Symbol, entry_price, sl, tp, comment);
+    else
+        result = trade.Sell(lots, _Symbol, entry_price, sl, tp, comment);
+
+    if(!result) {
+        Print("【回落反向】开仓失败: ", trade.ResultRetcode(), " - ",
+              trade.ResultRetcodeDescription());
+        return false;
+    }
+
+    MarkPullbackBarOpened(from_high_extreme);
+    Print("【回落反向】开仓成功 ", (order_type == ORDER_TYPE_BUY ? "多" : "空"),
+          " 手数:", lots, " 极值:", extreme_price, " SL:", sl, " TP:", tp);
+    return true;
+}
+
+void TryArmPullbackWatch()
+{
+    if(!InpEnablePullbackReverse || !latest_wave.exists)
+        return;
+
+    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    if(ask > latest_wave.high_price && !latest_wave.high_pullback_reverse_used) {
+        if(!g_high_pullback_watch.active ||
+           g_high_pullback_watch.extreme_price != latest_wave.high_price) {
+            g_high_pullback_watch.active = true;
+            g_high_pullback_watch.extreme_price = latest_wave.high_price;
+            g_high_pullback_watch.bars_checked = 0;
+            if(InpShowDebugInfo)
+                Print("【回落反向】开始监测破高 极值:", latest_wave.high_price,
+                      " 共", InpPullbackReverseWatchBars, "根K");
+        }
+    }
+
+    if(bid < latest_wave.low_price && !latest_wave.low_pullback_reverse_used) {
+        if(!g_low_pullback_watch.active ||
+           g_low_pullback_watch.extreme_price != latest_wave.low_price) {
+            g_low_pullback_watch.active = true;
+            g_low_pullback_watch.extreme_price = latest_wave.low_price;
+            g_low_pullback_watch.bars_checked = 0;
+            if(InpShowDebugInfo)
+                Print("【回落反向】开始监测破低 极值:", latest_wave.low_price,
+                      " 共", InpPullbackReverseWatchBars, "根K");
+        }
+    }
+}
+
+void ProcessPullbackReverseOnNewBar()
+{
+    if(!InpEnablePullbackReverse || !latest_wave.exists)
+        return;
+
+    const int max_bars = MathMax(1, InpPullbackReverseWatchBars);
+    const double wave_high = latest_wave.high_price;
+    const double wave_low = latest_wave.low_price;
+
+    if(g_high_pullback_watch.active && !latest_wave.high_pullback_reverse_used) {
+        const double close1 = iClose(_Symbol, InpTimeframe, 1);
+        if(close1 > 0.0 && close1 <= g_high_pullback_watch.extreme_price) {
+            if(OpenPullbackReversePosition(OrderTypeOnHighPullbackReverse(), true,
+                                           g_high_pullback_watch.extreme_price,
+                                           wave_high, wave_low)) {
+                latest_wave.high_pullback_reverse_used = true;
+            }
+            g_high_pullback_watch.active = false;
+        } else {
+            g_high_pullback_watch.bars_checked++;
+            if(g_high_pullback_watch.bars_checked >= max_bars) {
+                if(InpShowDebugInfo)
+                    Print("【回落反向】破高监测结束 未回落极值内");
+                g_high_pullback_watch.active = false;
+            }
+        }
+    }
+
+    if(g_low_pullback_watch.active && !latest_wave.low_pullback_reverse_used) {
+        const double close1 = iClose(_Symbol, InpTimeframe, 1);
+        if(close1 > 0.0 && close1 >= g_low_pullback_watch.extreme_price) {
+            if(OpenPullbackReversePosition(OrderTypeOnLowPullbackReverse(), false,
+                                           g_low_pullback_watch.extreme_price,
+                                           wave_high, wave_low)) {
+                latest_wave.low_pullback_reverse_used = true;
+            }
+            g_low_pullback_watch.active = false;
+        } else {
+            g_low_pullback_watch.bars_checked++;
+            if(g_low_pullback_watch.bars_checked >= max_bars) {
+                if(InpShowDebugInfo)
+                    Print("【回落反向】破低监测结束 未回升极值内");
+                g_low_pullback_watch.active = false;
+            }
+        }
+    }
+}
+
+void CheckPullbackReverseSignals()
+{
+    if(!InpEnablePullbackReverse)
+        return;
+
+    TryArmPullbackWatch();
+
+    static datetime s_last_bar_time = 0;
+    const datetime bar_time = iTime(_Symbol, InpTimeframe, 0);
+    if(bar_time == 0 || bar_time == s_last_bar_time)
+        return;
+    s_last_bar_time = bar_time;
+
+    ProcessPullbackReverseOnNewBar();
 }
 
 //+------------------------------------------------------------------+
