@@ -3,7 +3,7 @@
 //|                              聚合箱体突破策略 - 完整交易版本          |
 //+------------------------------------------------------------------+
 #property copyright "Breakout Strategy"
-#property version   "1.21"
+#property version   "1.30"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -17,7 +17,8 @@ enum ENUM_LOT_SIZE_MODE {
 // 破高/破低开仓方向
 enum ENUM_BREAKOUT_DIRECTION {
     BREAKOUT_DIR_FOLLOW = 0,  // 顺势(破高多/破低空)
-    BREAKOUT_DIR_REVERSE = 1  // 反向(破高空/破低多)
+    BREAKOUT_DIR_REVERSE = 1, // 反向(破高空/破低多)
+    BREAKOUT_DIR_RANDOM = 2   // 随机(每段结构随机顺势/反向)
 };
 
 //+------------------------------------------------------------------+
@@ -40,6 +41,7 @@ input bool     InpLargeWaveRetryAfterStopLoss = false; // 边界止损后再挂�
 input int      InpLargeWaveStopLossPoints = 80;      // 止损点数
 input int      InpLargeWaveTakeProfitPoints = 120;   // 止盈点数
 input bool     InpLargeWaveUseTrailingStop = false;  // 使用移动止损
+input int      InpLargeWaveTrailingStopPoints = 500; // 移动止损点数(启动后跟踪距离)
 
 input group "=== 聚合箱体机制参数 ==="
 input bool     InpEnableBoxTrade = true;        // 启用聚合箱体突破机制
@@ -52,6 +54,7 @@ input bool     InpBoxRetryAfterStopLoss = false; // 边界止损后再挂一单
 input int      InpBoxStopLossPoints = 80;       // 止损点数
 input int      InpBoxTakeProfitPoints = 120;    // 止盈点数
 input bool     InpBoxUseTrailingStop = false;   // 使用移动止损
+input int      InpBoxTrailingStopPoints = 500;  // 移动止损点数(启动后跟踪距离)
 
 input group "=== 仓位管理模式 ==="
 input ENUM_LOT_SIZE_MODE InpLotSizeMode = LOT_SIZE_RISK_PERCENT; // 手数模式
@@ -59,12 +62,18 @@ input double   InpFixedLots = 0.01;             // 固定手数
 input double   InpRiskPercent = 5.0;            // 每笔风险占结余%
 input double   InpMaxLots = 10.0;               // 单笔最大手数
 
+input group "=== 挂单延迟预设机制 ==="
+input bool     InpEnableDelayedPreset = false;  // 是否启用延迟预设
+input int      InpDelayedPresetHoldMinutes = 1; // 持仓时间(分钟) 到期市价平仓
+input bool     InpDelayedPresetSetStopLoss = true; // 是否设置止损(true=忽略持仓时间)
+
 input group "=== 其他参数 ==="
 input bool     InpCloseManualOrders = true;     // 禁止手工单
 input int      InpMagicNumber = 20260526;       // EA魔术号
 input bool     InpShowExtremeMarkers = false;   // 显示极值点标记
 input bool     InpBoxShowOnChart = false;       // 显示箱体标记
 input bool     InpShowLatestWaveMarker = false; // 显示最近有效波段标记
+input int      InpEntryAdverseSlippagePoints = 0;  // 开仓负向滑点(点) 挂单价偏移,0=关闭
 
 input group "=== 交易时段(北京时间) ==="
 input bool     InpEnableTradeSessionFilter = false; // 启用时段过滤
@@ -132,6 +141,8 @@ AggregateBoxInfo active_box;
 double g_sync_box_high = 0.0;
 double g_sync_box_low = 0.0;
 int g_box_draw_id = 0;
+ENUM_BREAKOUT_DIRECTION g_lw_resolved_dir = BREAKOUT_DIR_FOLLOW;
+ENUM_BREAKOUT_DIRECTION g_box_resolved_dir = BREAKOUT_DIR_FOLLOW;
 
 // 极值点结构体定义
 struct ExtremePoint {
@@ -179,6 +190,11 @@ ENUM_ORDER_TYPE PendingTypeOnHighBreakout(const ENUM_BREAKOUT_DIRECTION dir);
 ENUM_ORDER_TYPE PendingTypeOnLowBreakout(const ENUM_BREAKOUT_DIRECTION dir);
 long PosTypeOnHighBreakout(const ENUM_BREAKOUT_DIRECTION dir);
 long PosTypeOnLowBreakout(const ENUM_BREAKOUT_DIRECTION dir);
+string BreakoutDirectionInputLabel(const ENUM_BREAKOUT_DIRECTION dir);
+void RollRandomLargeWaveDirection();
+void RollRandomBoxDirection();
+ENUM_BREAKOUT_DIRECTION EffectiveLargeWaveDirection();
+ENUM_BREAKOUT_DIRECTION EffectiveBoxDirection();
 void SyncPendingAtExtreme(const bool at_high, const double trigger_price,
                           const double range_high, const double range_low,
                           const ENUM_BREAKOUT_DIRECTION dir, const int sl_points,
@@ -191,7 +207,21 @@ bool PlaceBreakoutPendingOrder(const ENUM_ORDER_TYPE pending_type, const double 
 double StopLossOffsetPoints(const int sl_points);
 double TakeProfitOffsetPoints(const int tp_points);
 int StopLossPointsFromComment(const string &comment);
+int TakeProfitPointsFromComment(const string &comment);
+int TrailingStopPointsFromComment(const string &comment);
 bool UseTrailingStopFromComment(const string &comment);
+bool IsEaTradeComment(const string &comment);
+bool CalcDelayedPresetSlTp(const ENUM_POSITION_TYPE pos_type, const double open_price,
+                           const int sl_points, const int tp_points, const bool set_sl,
+                           double &sl, double &tp);
+void ClampDelayedPresetSlTpForModify(const ENUM_POSITION_TYPE pos_type,
+                                     double &sl, double &tp);
+bool DelayedPresetProtectionApplied(const ENUM_POSITION_TYPE pos_type,
+                                    const double current_sl, const double current_tp,
+                                    const bool set_sl);
+void ApplyDelayedPresetToPosition(const ulong ticket);
+void CheckDelayedPresetTimeExit(const ulong ticket);
+void ManageDelayedPresetPosition(const ulong ticket);
 double CalculateLotSize(const int sl_points);
 double NormalizeVolumeLots(double lots);
 void ManagePositions();
@@ -203,6 +233,8 @@ int BeijingMinutesOfDay();
 bool IsWithinTradeSession();
 void EnforceTradeSessionOnTick();
 void LogDealFees(const ulong deal_ticket);
+double PendingOrderPriceWithAdverseSlippage(const ENUM_ORDER_TYPE pending_type,
+                                            const double structural_price);
 
 //+------------------------------------------------------------------+
 //| 交易时段(北京时间 UTC+8)                                          |
@@ -328,6 +360,7 @@ int OnInit()
     trade.SetExpertMagicNumber(InpMagicNumber);
     trade.SetDeviationInPoints(10);
     trade.SetTypeFilling(ORDER_FILLING_IOC);
+    MathSrand((uint)(TimeLocal() ^ InpMagicNumber ^ ChartID()));
 
     // 初始化最新有效波段
     latest_wave.exists = false;
@@ -347,16 +380,20 @@ int OnInit()
     g_sync_box_high = 0.0;
     g_sync_box_low = 0.0;
     g_box_draw_id = 0;
+    g_lw_resolved_dir = BREAKOUT_DIR_FOLLOW;
+    g_box_resolved_dir = BREAKOUT_DIR_FOLLOW;
 
     Print("========================================");
     Print("20260526_box_breakout 初始化成功");
     Print("品种:", _Symbol, " Magic:", InpMagicNumber);
     Print("结构有效波段: ", InpMinWavePercent, "% - ", InpMaxWavePercent, "%");
     Print("大波段突破:", (InpEnableLargeWaveTrade ? "开" : "关"),
-          " (", InpLargeWaveMinPercent, "%, ", InpLargeWaveMaxPercent, "%]");
+          " (", InpLargeWaveMinPercent, "%, ", InpLargeWaveMaxPercent, "%] 方向:",
+          BreakoutDirectionInputLabel(InpLargeWaveDirection));
     Print("聚合箱体:", (InpEnableBoxTrade ? "开" : "关"),
           " 成箱波段 [", InpBoxWaveMinPercent, "%, ", InpBoxWaveMaxPercent, "%] 段数",
-          InpBoxMinWaves, "-", (InpBoxMaxWaves > 0 ? IntegerToString(InpBoxMaxWaves) : "不限"));
+          InpBoxMinWaves, "-", (InpBoxMaxWaves > 0 ? IntegerToString(InpBoxMaxWaves) : "不限"),
+          " 方向:", BreakoutDirectionInputLabel(InpBoxDirection));
     if(InpBoxMaxWaves > 0 && InpBoxMaxWaves < InpBoxMinWaves)
         Print("【参数警告】成箱最多段数 < 最少段数, 将无法成箱");
     if(InpEnableTradeSessionFilter) {
@@ -367,6 +404,21 @@ int OnInit()
     } else {
         Print("交易时段过滤: 关");
     }
+    if(InpEnableDelayedPreset) {
+        Print("挂单延迟预设: 开 挂单无SL/TP, 成交后按开仓价设");
+        if(InpDelayedPresetSetStopLoss)
+            Print("  成交后设SL+TP(大/箱体各自点数), 不按持仓时间平仓");
+        else {
+            Print("  成交后仅设TP, ", InpDelayedPresetHoldMinutes, " 分钟后市价平仓");
+            if(InpDelayedPresetHoldMinutes <= 0)
+                Print("【参数警告】持仓时间<=0 且未设止损, 将无法按时平仓");
+        }
+    } else {
+        Print("挂单延迟预设: 关(挂单同时设SL/TP)");
+    }
+    if(InpEntryAdverseSlippagePoints > 0)
+        Print("开仓负向滑点: ", InpEntryAdverseSlippagePoints,
+              " 点(挂单价相对结构边界向不利方向偏移)");
     g_last_tick_in_trade_session = IsWithinTradeSession();
     Print("========================================");
 
@@ -428,6 +480,20 @@ void LogDealFees(const ulong deal_ticket)
           " 净利=", DoubleToString(net, 2));
 }
 
+double PendingOrderPriceWithAdverseSlippage(const ENUM_ORDER_TYPE pending_type,
+                                            const double structural_price)
+{
+    if(InpEntryAdverseSlippagePoints <= 0)
+        return NormalizeDouble(structural_price, _Digits);
+
+    const double slip = InpEntryAdverseSlippagePoints * _Point;
+    if(pending_type == ORDER_TYPE_BUY_STOP || pending_type == ORDER_TYPE_BUY_LIMIT)
+        return NormalizeDouble(structural_price + slip, _Digits);
+    if(pending_type == ORDER_TYPE_SELL_STOP || pending_type == ORDER_TYPE_SELL_LIMIT)
+        return NormalizeDouble(structural_price - slip, _Digits);
+    return NormalizeDouble(structural_price, _Digits);
+}
+
 //+------------------------------------------------------------------+
 //| 交易事务处理函数 - 用于检测亏损单                                    |
 //+------------------------------------------------------------------+
@@ -451,30 +517,34 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
         const string deal_comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
         const ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
         if(StringFind(deal_comment, "LW") == 0) {
+            const ENUM_BREAKOUT_DIRECTION lw_dir = EffectiveLargeWaveDirection();
             if(deal_type == DEAL_TYPE_BUY) {
-                if(PosTypeOnHighBreakout(InpLargeWaveDirection) == POSITION_TYPE_BUY)
+                if(PosTypeOnHighBreakout(lw_dir) == POSITION_TYPE_BUY)
                     MarkLargeWaveHighUsed();
-                else if(PosTypeOnLowBreakout(InpLargeWaveDirection) == POSITION_TYPE_BUY)
+                else if(PosTypeOnLowBreakout(lw_dir) == POSITION_TYPE_BUY)
                     MarkLargeWaveLowUsed();
             } else if(deal_type == DEAL_TYPE_SELL) {
-                if(PosTypeOnHighBreakout(InpLargeWaveDirection) == POSITION_TYPE_SELL)
+                if(PosTypeOnHighBreakout(lw_dir) == POSITION_TYPE_SELL)
                     MarkLargeWaveHighUsed();
-                else if(PosTypeOnLowBreakout(InpLargeWaveDirection) == POSITION_TYPE_SELL)
+                else if(PosTypeOnLowBreakout(lw_dir) == POSITION_TYPE_SELL)
                     MarkLargeWaveLowUsed();
             }
         } else if(StringFind(deal_comment, "BX") == 0) {
+            const ENUM_BREAKOUT_DIRECTION bx_dir = EffectiveBoxDirection();
             if(deal_type == DEAL_TYPE_BUY) {
-                if(PosTypeOnHighBreakout(InpBoxDirection) == POSITION_TYPE_BUY)
+                if(PosTypeOnHighBreakout(bx_dir) == POSITION_TYPE_BUY)
                     MarkBoxHighUsed();
-                else if(PosTypeOnLowBreakout(InpBoxDirection) == POSITION_TYPE_BUY)
+                else if(PosTypeOnLowBreakout(bx_dir) == POSITION_TYPE_BUY)
                     MarkBoxLowUsed();
             } else if(deal_type == DEAL_TYPE_SELL) {
-                if(PosTypeOnHighBreakout(InpBoxDirection) == POSITION_TYPE_SELL)
+                if(PosTypeOnHighBreakout(bx_dir) == POSITION_TYPE_SELL)
                     MarkBoxHighUsed();
-                else if(PosTypeOnLowBreakout(InpBoxDirection) == POSITION_TYPE_SELL)
+                else if(PosTypeOnLowBreakout(bx_dir) == POSITION_TYPE_SELL)
                     MarkBoxLowUsed();
             }
         }
+        if(InpEnableDelayedPreset && trans.position > 0)
+            ApplyDelayedPresetToPosition(trans.position);
     } else if(entry == DEAL_ENTRY_OUT) {
         HandleStopLossRetryOnDeal(trans.deal);
     }
@@ -970,6 +1040,8 @@ void MarkBoxLowUsed()
 //+------------------------------------------------------------------+
 void HandleStopLossRetryOnDeal(const ulong deal_ticket)
 {
+    if(InpEnableDelayedPreset && !InpDelayedPresetSetStopLoss)
+        return;
     if(!HistoryDealSelect(deal_ticket))
         return;
     if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT)
@@ -1000,9 +1072,9 @@ void HandleStopLossRetryOnDeal(const ulong deal_ticket)
             entry_pos_type = POSITION_TYPE_SELL;
         entry_comment = HistoryDealGetString(in_ticket, DEAL_COMMENT);
         if(StringFind(entry_comment, "BX") == 0)
-            entry_dir = InpBoxDirection;
+            entry_dir = EffectiveBoxDirection();
         else
-            entry_dir = InpLargeWaveDirection;
+            entry_dir = EffectiveLargeWaveDirection();
         break;
     }
     if(entry_pos_type < 0 || entry_comment == "")
@@ -1259,6 +1331,41 @@ void FilterBreakouts(const int &breakout_bars[], const int &breakout_types[],
 //+------------------------------------------------------------------+
 //| 突破挂单管理                                                       |
 //+------------------------------------------------------------------+
+string BreakoutDirectionInputLabel(const ENUM_BREAKOUT_DIRECTION dir)
+{
+    if(dir == BREAKOUT_DIR_REVERSE)
+        return "反向";
+    if(dir == BREAKOUT_DIR_RANDOM)
+        return "随机";
+    return "顺势";
+}
+
+void RollRandomLargeWaveDirection()
+{
+    g_lw_resolved_dir = ((MathRand() & 1) != 0) ? BREAKOUT_DIR_FOLLOW : BREAKOUT_DIR_REVERSE;
+    Print("【大波段】随机开仓方向: ", BreakoutDirectionInputLabel(g_lw_resolved_dir));
+}
+
+void RollRandomBoxDirection()
+{
+    g_box_resolved_dir = ((MathRand() & 1) != 0) ? BREAKOUT_DIR_FOLLOW : BREAKOUT_DIR_REVERSE;
+    Print("【聚合箱体】随机开仓方向: ", BreakoutDirectionInputLabel(g_box_resolved_dir));
+}
+
+ENUM_BREAKOUT_DIRECTION EffectiveLargeWaveDirection()
+{
+    if(InpLargeWaveDirection != BREAKOUT_DIR_RANDOM)
+        return InpLargeWaveDirection;
+    return g_lw_resolved_dir;
+}
+
+ENUM_BREAKOUT_DIRECTION EffectiveBoxDirection()
+{
+    if(InpBoxDirection != BREAKOUT_DIR_RANDOM)
+        return InpBoxDirection;
+    return g_box_resolved_dir;
+}
+
 long PosTypeOnHighBreakout(const ENUM_BREAKOUT_DIRECTION dir)
 {
     if(dir == BREAKOUT_DIR_REVERSE)
@@ -1394,25 +1501,30 @@ bool PlaceBreakoutPendingOrder(const ENUM_ORDER_TYPE pending_type, const double 
                                const int sl_points, const int tp_points,
                                const string comment)
 {
+    const double order_price = PendingOrderPriceWithAdverseSlippage(pending_type, trigger_price);
     const double lots = CalculateLotSize(sl_points);
     if(lots <= 0.0)
         return false;
 
     double sl = 0.0, tp = 0.0;
-    if(!CalcPendingSlTp(pending_type, trigger_price, sl_points, tp_points, sl, tp))
+    if(InpEnableDelayedPreset) {
+        sl = 0.0;
+        tp = 0.0;
+    } else if(!CalcPendingSlTp(pending_type, order_price, sl_points, tp_points, sl, tp)) {
         return false;
+    }
 
     trade.SetExpertMagicNumber(InpMagicNumber);
 
     bool result = false;
     if(pending_type == ORDER_TYPE_BUY_STOP)
-        result = trade.BuyStop(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+        result = trade.BuyStop(lots, order_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
     else if(pending_type == ORDER_TYPE_SELL_STOP)
-        result = trade.SellStop(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+        result = trade.SellStop(lots, order_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
     else if(pending_type == ORDER_TYPE_BUY_LIMIT)
-        result = trade.BuyLimit(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+        result = trade.BuyLimit(lots, order_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
     else if(pending_type == ORDER_TYPE_SELL_LIMIT)
-        result = trade.SellLimit(lots, trigger_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+        result = trade.SellLimit(lots, order_price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
 
     if(!result) {
         Print("挂单失败 ", comment, " ", EnumToString(pending_type),
@@ -1434,11 +1546,12 @@ void SyncPendingAtExtreme(const bool at_high, const double trigger_price,
         (pending_type == ORDER_TYPE_SELL_STOP ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_STOP);
     CancelEaPendingOrderType(stale_type, comment_prefix);
 
+    const double order_price = PendingOrderPriceWithAdverseSlippage(pending_type, trigger_price);
     const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     const bool price_crossed = at_high ?
-        (ask >= trigger_price - _Point * 0.5) :
-        (bid <= trigger_price + _Point * 0.5);
+        (ask >= order_price - _Point * 0.5) :
+        (bid <= order_price + _Point * 0.5);
 
     if(price_crossed) {
         if(StringCompare(comment_prefix, "LW") == 0) {
@@ -1460,17 +1573,28 @@ void SyncPendingAtExtreme(const bool at_high, const double trigger_price,
     const string comment = StringFormat("%s%d@%.*f", comment_prefix, range_pts, _Digits, pending_price);
 
     double expected_sl = 0.0, expected_tp = 0.0;
-    if(!CalcPendingSlTp(pending_type, trigger_price, sl_points, tp_points, expected_sl, expected_tp))
+    if(InpEnableDelayedPreset) {
+        expected_sl = 0.0;
+        expected_tp = 0.0;
+    } else if(!CalcPendingSlTp(pending_type, order_price, sl_points, tp_points, expected_sl, expected_tp)) {
         return;
+    }
 
     ulong ticket = FindEaPendingOrder(pending_type, comment_prefix);
     if(ticket > 0 && OrderSelect(ticket)) {
         const double existing_price = OrderGetDouble(ORDER_PRICE_OPEN);
         const double lots = CalculateLotSize(sl_points);
-        if(MathAbs(existing_price - trigger_price) > _Point * 0.5 ||
+        const double existing_sl = OrderGetDouble(ORDER_SL);
+        const double existing_tp = OrderGetDouble(ORDER_TP);
+        bool sl_tp_changed = false;
+        if(InpEnableDelayedPreset)
+            sl_tp_changed = (existing_sl != 0.0 || existing_tp != 0.0);
+        else
+            sl_tp_changed = (MathAbs(existing_sl - expected_sl) > _Point * 0.5 ||
+                             MathAbs(existing_tp - expected_tp) > _Point * 0.5);
+        if(MathAbs(existing_price - order_price) > _Point * 0.5 ||
            MathAbs(OrderGetDouble(ORDER_VOLUME_CURRENT) - lots) > 1e-8 ||
-           MathAbs(OrderGetDouble(ORDER_SL) - expected_sl) > _Point * 0.5 ||
-           MathAbs(OrderGetDouble(ORDER_TP) - expected_tp) > _Point * 0.5) {
+           sl_tp_changed) {
             trade.OrderDelete(ticket);
             ticket = 0;
         }
@@ -1493,20 +1617,23 @@ void SyncLargeWaveBreakoutPendingOrders()
         CancelLargeWavePendingOrders();
         g_sync_wave_high = latest_wave.high_price;
         g_sync_wave_low = latest_wave.low_price;
+        if(InpLargeWaveDirection == BREAKOUT_DIR_RANDOM)
+            RollRandomLargeWaveDirection();
     }
 
     const double wh = latest_wave.high_price;
     const double wl = latest_wave.low_price;
+    const ENUM_BREAKOUT_DIRECTION lw_dir = EffectiveLargeWaveDirection();
 
     if(!latest_wave.high_used) {
-        SyncPendingAtExtreme(true, wh, wh, wl, InpLargeWaveDirection,
+        SyncPendingAtExtreme(true, wh, wh, wl, lw_dir,
                              InpLargeWaveStopLossPoints, InpLargeWaveTakeProfitPoints, "LW");
     } else {
         CancelLargeWavePendingAtHigh();
     }
 
     if(!latest_wave.low_used) {
-        SyncPendingAtExtreme(false, wl, wh, wl, InpLargeWaveDirection,
+        SyncPendingAtExtreme(false, wl, wh, wl, lw_dir,
                              InpLargeWaveStopLossPoints, InpLargeWaveTakeProfitPoints, "LW");
     } else {
         CancelLargeWavePendingAtLow();
@@ -1527,20 +1654,23 @@ void SyncBoxBreakoutPendingOrders()
         CancelBoxPendingOrders();
         g_sync_box_high = active_box.high_price;
         g_sync_box_low = active_box.low_price;
+        if(InpBoxDirection == BREAKOUT_DIR_RANDOM)
+            RollRandomBoxDirection();
     }
 
     const double bh = active_box.high_price;
     const double bl = active_box.low_price;
+    const ENUM_BREAKOUT_DIRECTION bx_dir = EffectiveBoxDirection();
 
     if(!active_box.high_used) {
-        SyncPendingAtExtreme(true, bh, bh, bl, InpBoxDirection,
+        SyncPendingAtExtreme(true, bh, bh, bl, bx_dir,
                              InpBoxStopLossPoints, InpBoxTakeProfitPoints, "BX");
     } else {
         CancelBoxPendingAtHigh();
     }
 
     if(!active_box.low_used) {
-        SyncPendingAtExtreme(false, bl, bh, bl, InpBoxDirection,
+        SyncPendingAtExtreme(false, bl, bh, bl, bx_dir,
                              InpBoxStopLossPoints, InpBoxTakeProfitPoints, "BX");
     } else {
         CancelBoxPendingAtLow();
@@ -1573,9 +1703,188 @@ int StopLossPointsFromComment(const string &comment)
 
 bool UseTrailingStopFromComment(const string &comment)
 {
+    if(InpEnableDelayedPreset)
+        return false;
     if(StringFind(comment, "BX") == 0)
         return InpBoxUseTrailingStop;
     return InpLargeWaveUseTrailingStop;
+}
+
+bool IsEaTradeComment(const string &comment)
+{
+    return (StringFind(comment, "LW") == 0 || StringFind(comment, "BX") == 0);
+}
+
+int TakeProfitPointsFromComment(const string &comment)
+{
+    if(StringFind(comment, "BX") == 0)
+        return InpBoxTakeProfitPoints;
+    return InpLargeWaveTakeProfitPoints;
+}
+
+int TrailingStopPointsFromComment(const string &comment)
+{
+    if(StringFind(comment, "BX") == 0)
+        return InpBoxTrailingStopPoints;
+    return InpLargeWaveTrailingStopPoints;
+}
+
+//+------------------------------------------------------------------+
+//| 延迟预设: 目标SL/TP按开仓价(固定, 不随现价漂移)                      |
+//+------------------------------------------------------------------+
+bool CalcDelayedPresetSlTp(const ENUM_POSITION_TYPE pos_type, const double open_price,
+                           const int sl_points, const int tp_points, const bool set_sl,
+                           double &sl, double &tp)
+{
+    if(tp_points <= 0)
+        return false;
+
+    const ENUM_ORDER_TYPE order_type = (pos_type == POSITION_TYPE_BUY) ?
+                                       ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+    if(!CalcPendingSlTp(order_type, open_price, sl_points, tp_points, sl, tp))
+        return false;
+
+    if(!set_sl)
+        sl = 0.0;
+    return true;
+}
+
+void ClampDelayedPresetSlTpForModify(const ENUM_POSITION_TYPE pos_type,
+                                     double &sl, double &tp)
+{
+    const int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    if(stops_level <= 0)
+        return;
+
+    const double min_dist = stops_level * _Point;
+
+    if(pos_type == POSITION_TYPE_BUY) {
+        const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        if(sl > 0.0) {
+            const double max_sl = NormalizeDouble(bid - min_dist, _Digits);
+            if(sl > max_sl)
+                sl = max_sl;
+        }
+        const double min_tp = NormalizeDouble(bid + min_dist, _Digits);
+        if(tp < min_tp)
+            tp = min_tp;
+    } else if(pos_type == POSITION_TYPE_SELL) {
+        const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        if(sl > 0.0) {
+            const double min_sl = NormalizeDouble(ask + min_dist, _Digits);
+            if(sl < min_sl)
+                sl = min_sl;
+        }
+        const double max_tp = NormalizeDouble(ask - min_dist, _Digits);
+        if(tp > max_tp)
+            tp = max_tp;
+    }
+}
+
+bool DelayedPresetProtectionApplied(const ENUM_POSITION_TYPE pos_type,
+                                    const double current_sl, const double current_tp,
+                                    const bool set_sl)
+{
+    if(current_tp <= 0.0)
+        return false;
+    if(set_sl && current_sl <= 0.0)
+        return false;
+    return true;
+}
+
+void LogDelayedPresetModifyFail(const ulong ticket, const double sl, const double tp,
+                                const uint retcode)
+{
+    static ulong s_last_ticket = 0;
+    static datetime s_last_time = 0;
+    static uint s_last_retcode = 0;
+
+    const datetime now = TimeCurrent();
+    if(ticket == s_last_ticket && retcode == s_last_retcode &&
+       now - s_last_time < 30)
+        return;
+
+    s_last_ticket = ticket;
+    s_last_time = now;
+    s_last_retcode = retcode;
+
+    Print("【延迟预设】设SL/TP失败 ticket=", ticket,
+          " SL=", DoubleToString(sl, _Digits),
+          " TP=", DoubleToString(tp, _Digits),
+          " Bid=", DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits),
+          " Ask=", DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_ASK), _Digits),
+          " 错误:", retcode, " ", trade.ResultRetcodeDescription());
+}
+
+void ApplyDelayedPresetToPosition(const ulong ticket)
+{
+    if(!InpEnableDelayedPreset || !PositionSelectByTicket(ticket))
+        return;
+
+    const string comment = PositionGetString(POSITION_COMMENT);
+    if(!IsEaTradeComment(comment))
+        return;
+
+    const ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    const double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+    const double current_sl = PositionGetDouble(POSITION_SL);
+    const double current_tp = PositionGetDouble(POSITION_TP);
+
+    if(DelayedPresetProtectionApplied(pos_type, current_sl, current_tp,
+                                      InpDelayedPresetSetStopLoss))
+        return;
+
+    const int sl_points = StopLossPointsFromComment(comment);
+    const int tp_points = TakeProfitPointsFromComment(comment);
+
+    double sl = 0.0, tp = 0.0;
+    if(!CalcDelayedPresetSlTp(pos_type, open_price, sl_points, tp_points,
+                              InpDelayedPresetSetStopLoss, sl, tp))
+        return;
+
+    ClampDelayedPresetSlTpForModify(pos_type, sl, tp);
+
+    trade.SetExpertMagicNumber(InpMagicNumber);
+    if(trade.PositionModify(ticket, sl, tp)) {
+        if(InpDelayedPresetSetStopLoss)
+            Print("【延迟预设】成交后设SL/TP ticket=", ticket, " 开仓=", open_price,
+                  " SL=", sl, " TP=", tp);
+        else
+            Print("【延迟预设】成交后设止盈 ticket=", ticket, " 开仓=", open_price,
+                  " TP=", tp, " (无止损)");
+    } else {
+        LogDelayedPresetModifyFail(ticket, sl, tp, trade.ResultRetcode());
+    }
+}
+
+void CheckDelayedPresetTimeExit(const ulong ticket)
+{
+    if(!InpEnableDelayedPreset || InpDelayedPresetSetStopLoss)
+        return;
+    if(InpDelayedPresetHoldMinutes <= 0)
+        return;
+    if(!PositionSelectByTicket(ticket))
+        return;
+
+    const string comment = PositionGetString(POSITION_COMMENT);
+    if(!IsEaTradeComment(comment))
+        return;
+
+    const datetime open_time = (datetime)PositionGetInteger(POSITION_TIME);
+    if(TimeCurrent() < open_time + InpDelayedPresetHoldMinutes * 60)
+        return;
+
+    trade.SetExpertMagicNumber(InpMagicNumber);
+    if(trade.PositionClose(ticket)) {
+        Print("【延迟预设】持仓 ", InpDelayedPresetHoldMinutes, " 分钟到期平仓 ticket=", ticket,
+              " ", comment);
+    }
+}
+
+void ManageDelayedPresetPosition(const ulong ticket)
+{
+    ApplyDelayedPresetToPosition(ticket);
+    CheckDelayedPresetTimeExit(ticket);
 }
 
 //+------------------------------------------------------------------+
@@ -1637,12 +1946,16 @@ void ManagePositions()
         if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
             continue;
 
-        CheckTrailingStop(PositionGetTicket(i));
+        const ulong ticket = PositionGetTicket(i);
+        if(InpEnableDelayedPreset)
+            ManageDelayedPresetPosition(ticket);
+        else
+            CheckTrailingStop(ticket);
     }
 }
 
 //+------------------------------------------------------------------+
-//| 检查移动止损                                                       |
+//| 移动止损: 浮盈>=跟踪点数后, SL跟在现价后同样点数                      |
 //+------------------------------------------------------------------+
 void CheckTrailingStop(ulong ticket)
 {
@@ -1653,41 +1966,56 @@ void CheckTrailingStop(ulong ticket)
     if(!UseTrailingStopFromComment(comment))
         return;
 
-    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-    double current_sl = PositionGetDouble(POSITION_SL);
-    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    double current_price = (pos_type == POSITION_TYPE_BUY) ?
-                           SymbolInfoDouble(_Symbol, SYMBOL_BID) :
-                           SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    const int trail_points = TrailingStopPointsFromComment(comment);
+    if(trail_points <= 0)
+        return;
 
-    const double stop_loss_amount = StopLossOffsetPoints(StopLossPointsFromComment(comment));
+    const double trail_dist = TakeProfitOffsetPoints(trail_points);
+    const double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+    const double current_sl = PositionGetDouble(POSITION_SL);
+    const ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    const int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    const double min_dist = stops_level * _Point;
 
-    // 计算浮盈
-    double profit_amount = 0;
+    double current_price = 0.0;
+    double profit_amount = 0.0;
+    double new_sl = 0.0;
+
     if(pos_type == POSITION_TYPE_BUY) {
+        current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
         profit_amount = current_price - open_price;
-    } else {
+        if(profit_amount + _Point * 0.5 < trail_dist)
+            return;
+
+        new_sl = NormalizeDouble(current_price - trail_dist, _Digits);
+        if(stops_level > 0 && current_price - new_sl < min_dist)
+            new_sl = NormalizeDouble(current_price - min_dist, _Digits);
+        if(new_sl >= current_price - _Point * 0.5)
+            return;
+        if(current_sl > 0.0 && new_sl <= current_sl + _Point * 0.5)
+            return;
+    } else if(pos_type == POSITION_TYPE_SELL) {
+        current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
         profit_amount = open_price - current_price;
+        if(profit_amount + _Point * 0.5 < trail_dist)
+            return;
+
+        new_sl = NormalizeDouble(current_price + trail_dist, _Digits);
+        if(stops_level > 0 && new_sl - current_price < min_dist)
+            new_sl = NormalizeDouble(current_price + min_dist, _Digits);
+        if(new_sl <= current_price + _Point * 0.5)
+            return;
+        if(current_sl > 0.0 && new_sl >= current_sl - _Point * 0.5)
+            return;
+    } else {
+        return;
     }
 
-    // 浮盈达到止损金额，移动止损至成本价
-    if(profit_amount >= stop_loss_amount) {
-        double new_sl = open_price;
-
-        // 检查是否需要更新
-        bool need_update = false;
-        if(pos_type == POSITION_TYPE_BUY && (current_sl < new_sl || current_sl == 0)) {
-            need_update = true;
-        } else if(pos_type == POSITION_TYPE_SELL && (current_sl > new_sl || current_sl == 0)) {
-            need_update = true;
-        }
-
-        if(need_update) {
-            double tp = PositionGetDouble(POSITION_TP);
-            if(trade.PositionModify(ticket, new_sl, tp)) {
-                Print("移动止损至成本价 - Ticket:", ticket, " 新止损:", new_sl);
-            }
-        }
+    const double tp = PositionGetDouble(POSITION_TP);
+    trade.SetExpertMagicNumber(InpMagicNumber);
+    if(trade.PositionModify(ticket, new_sl, tp)) {
+        Print("【移动止损】ticket=", ticket, " 新SL=", new_sl,
+              " 跟踪", trail_points, "点 现价=", DoubleToString(current_price, _Digits));
     }
 }
 
